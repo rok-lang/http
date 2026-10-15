@@ -4,6 +4,8 @@
 
 mod model;
 mod h1;
+mod hpack;
+mod h2;
 
 pub fn expect(ok: bool, what: str) {
     if !ok { panic(f"check failed: {what}"); }

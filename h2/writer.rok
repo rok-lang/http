@@ -1,0 +1,281 @@
+// The writing side of an HTTP/2 connection: one task owns the socket's
+// write half, the HPACK encoder, the send windows and the stream
+// scheduler; everything else talks to it through `Cmd`s.
+
+use rok::std::net::{TcpStream, Shutdown};
+use pkg::conn::{Io, deadline_in};
+use pkg::h2::frame;
+use pkg::h2::frame::{Prio, MAX_WINDOW, FLOW_CONTROL_ERROR};
+use pkg::h2::hpack::Encoder;
+
+pub(pkg) enum Cmd {
+    /// A ready frame (or frames), sent ahead of queued data.
+    Raw(List<u8>),
+    /// A stream exists: start its send window.
+    Open(u32),
+    /// A header block: stream, fields, END_STREAM.
+    Headers(u32, List<(str, str)>, bool),
+    /// Data: stream, bytes, END_STREAM, told `0` once written (`-1` if
+    /// the stream or connection died first).
+    Data(u32, List<u8>, bool, Sender<i32> | none),
+    /// WINDOW_UPDATE from the peer.
+    Window(u32, u32),
+    /// The peer's SETTINGS, to apply and acknowledge.
+    Settings(List<(u16, u32)>),
+    Priority(u32, Prio),
+    /// The stream is gone: drop its queued data.
+    Reset(u32),
+    /// Stop after writing what is ready.
+    Close,
+}
+
+struct Queued {
+    data: List<u8>;
+    off: usize;
+    end: bool;
+    ack: Sender<i32> | none;
+}
+
+fn tell(ack: Sender<i32> | none, v: i32) {
+    if let a: Sender<i32> = ack { try? a.send(v); }
+}
+
+/// Run until `Close` and the channel's end.
+pub(pkg) async fn run(s: TcpStream, rx: Receiver<Cmd>, huffman: bool, timeout: Duration | none) {
+    let io = Io::new(s);
+    let w = W {
+        enc: Encoder::new(huffman),
+        wins: Dict::new(),
+        queues: Dict::new(),
+        prios: Dict::new(),
+        active: List::new(),
+        out: List::new(),
+        // [connection window, peer's initial window, max frame size]
+        nums: [65535i64, 65535i64, 16384i64],
+        flags: [false, false],
+    };
+    loop {
+        let first = await rx.recv_async();
+        let c = match first {
+            x: Cmd => x,
+            none => break,
+        };
+        w.handle(c);
+        // Take what else is queued so it goes out in one write.
+        while let x: Cmd = rx.try_recv() { w.handle(x); }
+        if !w.dead() { w.flush_data(); }
+        if !w.out.is_empty() && !w.dead() {
+            let buf = w.out;
+            w.out = List::new();
+            try await io.write(buf[0:buf.len()], deadline_in(timeout)) catch _ {
+                w.die();
+                try? s.shutdown(Shutdown::Both);
+            };
+        } else {
+            w.out = List::new();
+        }
+        if w.closing() && !w.dead() {
+            w.die();
+            try? s.shutdown(Shutdown::Both);
+        }
+    }
+    w.die();
+}
+
+struct W {
+    enc: Encoder;
+    wins: Dict<u32, i64>;
+    queues: Dict<u32, Deque<Queued>>;
+    prios: Dict<u32, Prio>;
+    /// Streams with queued data, in scheduling order.
+    active: List<u32>;
+    out: List<u8>;
+    nums: List<i64>;
+    /// `[dead, closing]`.
+    flags: List<bool>;
+}
+
+impl W {
+    fn dead(self) -> bool { self.flags[0] }
+
+    fn closing(self) -> bool { self.flags[1] }
+
+    /// Stop writing: fail every queued write.
+    fn die(self) {
+        self.flags[0] = true;
+        for sid in self.active.clone() { self.drop_stream(sid); }
+    }
+
+    fn drop_stream(self, sid: u32) {
+        if let q: Deque<Queued> = self.queues.get(sid) {
+            while let p: Queued = q.pop_front() { tell(p.ack, -1); }
+        }
+        self.queues.remove(sid);
+        self.wins.remove(sid);
+        self.prios.remove(sid);
+        let i = 0usize;
+        while i < self.active.len() {
+            if self.active[i] == sid { self.active.remove(i); } else { i += 1; }
+        }
+    }
+
+    fn handle(self, c: Cmd) {
+        match c {
+            Cmd::Data(sid, d, end, ack) => {
+                if self.dead() || !self.wins.contains_key(sid) {
+                    tell(ack, -1);
+                    return;
+                }
+                let q = self.queues.get(sid) ?? Deque::<Queued>::new();
+                q.push_back(Queued { data: d, off: 0usize, end: end, ack: ack });
+                self.queues.insert(sid, q);
+                let present = false;
+                for a in self.active {
+                    if a == sid { present = true; }
+                }
+                if !present { self.active.push(sid); }
+            },
+            Cmd::Close => { self.flags[1] = true; },
+            _ => if !self.dead() { self.control(c); },
+        }
+    }
+
+    fn control(self, c: Cmd) {
+        match c {
+            Cmd::Raw(b) => self.out.extend(b),
+            Cmd::Open(sid) => if !self.wins.contains_key(sid) { self.wins.insert(sid, self.nums[1]); },
+            Cmd::Headers(sid, fields, end) => {
+                if !self.wins.contains_key(sid) { self.wins.insert(sid, self.nums[1]); }
+                let block = self.enc.encode(fields);
+                let max = self.nums[2] as usize;
+                let at = 0usize;
+                let first = true;
+                loop {
+                    let n = if block.len() - at > max { max } else { block.len() - at };
+                    let last = at + n == block.len();
+                    let typ = if first { frame::HEADERS } else { frame::CONTINUATION };
+                    let fl = (if last { frame::END_HEADERS } else { 0u8 }) | (if first && end { frame::END_STREAM } else { 0u8 });
+                    frame::put(self.out, typ, fl, sid, block[at:at + n]);
+                    at += n;
+                    first = false;
+                    if last { break; }
+                }
+                if end { self.wins.remove(sid); }
+            },
+            Cmd::Window(sid, inc) => {
+                if sid == 0u32 {
+                    let v = self.nums[0] + inc as i64;
+                    if v > MAX_WINDOW {
+                        self.out.extend(frame::goaway(0u32, FLOW_CONTROL_ERROR, "connection window overflow"));
+                        self.flags[1] = true;
+                        return;
+                    }
+                    self.nums[0] = v;
+                } else if let cur: i64 = self.wins.get(sid) {
+                    if cur + inc as i64 > MAX_WINDOW {
+                        self.out.extend(frame::rst(sid, FLOW_CONTROL_ERROR));
+                        self.drop_stream(sid);
+                        return;
+                    }
+                    self.wins.insert(sid, cur + inc as i64);
+                }
+            },
+            Cmd::Settings(pairs) => {
+                for (k, v) in pairs {
+                    if k == frame::S_HEADER_TABLE_SIZE {
+                        self.enc.set_max(v as usize);
+                    } else if k == frame::S_INITIAL_WINDOW_SIZE {
+                        let delta = v as i64 - self.nums[1];
+                        self.nums[1] = v as i64;
+                        for sid in self.wins.keys().collect::<List<u32>>() {
+                            let nv = (self.wins.get(sid) ?? 0i64) + delta;
+                            if nv > MAX_WINDOW {
+                                self.out.extend(frame::goaway(0u32, FLOW_CONTROL_ERROR, "stream window overflow"));
+                                self.flags[1] = true;
+                                return;
+                            }
+                            self.wins.insert(sid, nv);
+                        }
+                    } else if k == frame::S_MAX_FRAME_SIZE {
+                        self.nums[2] = v as i64;
+                    }
+                }
+                frame::put(self.out, frame::SETTINGS, frame::ACK, 0u32, List::<u8>::new()[0:0]);
+            },
+            Cmd::Priority(sid, p) => self.prios.insert(sid, p),
+            Cmd::Reset(sid) => self.drop_stream(sid),
+            _ => {},
+        }
+    }
+
+    /// Whether `sid`'s next queued piece can go now.
+    fn sendable(self, sid: u32) -> bool {
+        let q = self.queues.get(sid) ?? { return false; };
+        let p = q.front() ?? { return false; };
+        if p.off == p.data.len() { return true; }
+        self.nums[0] > 0i64 && (self.wins.get(sid) ?? 0i64) > 0i64
+    }
+
+    /// Send queued data while windows allow, by RFC 9218 urgency;
+    /// incremental streams of one urgency take turns frame by frame.
+    fn flush_data(self) {
+        loop {
+            let best: u32 | none = none;
+            let best_u = 8u8;
+            let best_i = 0usize;
+            for i in 0..self.active.len() {
+                let sid = self.active[i];
+                if !self.sendable(sid) { continue; }
+                let u = (self.prios.get(sid) ?? Prio {}).urgency;
+                if u < best_u {
+                    best = sid;
+                    best_u = u;
+                    best_i = i;
+                }
+            }
+            let sid = match best {
+                x: u32 => x,
+                none => return,
+            };
+            self.send_one(sid, best_i);
+        }
+    }
+
+    fn send_one(self, sid: u32, idx: usize) {
+        let q = self.queues.get(sid) ?? { return; };
+        let p = q.pop_front() ?? { return; };
+        let left = (p.data.len() - p.off) as i64;
+        let n = left;
+        if n > self.nums[2] { n = self.nums[2]; }
+        if n > 0i64 {
+            let sw = self.wins.get(sid) ?? 0i64;
+            if n > self.nums[0] { n = self.nums[0]; }
+            if n > sw { n = sw; }
+            self.nums[0] = self.nums[0] - n;
+            self.wins.insert(sid, sw - n);
+        }
+        let done = n == left;
+        let fl = if done && p.end { frame::END_STREAM } else { 0u8 };
+        frame::put(self.out, frame::DATA, fl, sid, p.data[p.off:p.off + n as usize]);
+        p.off = p.off + n as usize;
+        if !done {
+            q.push_front(p);
+        } else {
+            tell(p.ack, 0);
+            if p.end {
+                self.queues.remove(sid);
+                self.wins.remove(sid);
+                self.prios.remove(sid);
+                self.active.remove(idx);
+                return;
+            }
+        }
+        if q.is_empty() {
+            self.queues.remove(sid);
+            self.active.remove(idx);
+        } else if (self.prios.get(sid) ?? Prio {}).incremental {
+            self.active.remove(idx);
+            self.active.push(sid);
+        }
+    }
+}

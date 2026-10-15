@@ -1,0 +1,175 @@
+// HTTP/2 frames (RFC 9113 section 4 and 6).
+
+use pkg::conn::Io;
+use pkg::error::{HttpError, ErrorKind};
+
+pub(pkg) const DATA: u8 = 0u8;
+pub(pkg) const HEADERS: u8 = 1u8;
+pub(pkg) const PRIORITY: u8 = 2u8;
+pub(pkg) const RST_STREAM: u8 = 3u8;
+pub(pkg) const SETTINGS: u8 = 4u8;
+pub(pkg) const PUSH_PROMISE: u8 = 5u8;
+pub(pkg) const PING: u8 = 6u8;
+pub(pkg) const GOAWAY: u8 = 7u8;
+pub(pkg) const WINDOW_UPDATE: u8 = 8u8;
+pub(pkg) const CONTINUATION: u8 = 9u8;
+/// RFC 9218 section 7.1.
+pub(pkg) const PRIORITY_UPDATE: u8 = 0x10u8;
+
+pub(pkg) const END_STREAM: u8 = 0x1u8;
+pub(pkg) const ACK: u8 = 0x1u8;
+pub(pkg) const END_HEADERS: u8 = 0x4u8;
+pub(pkg) const PADDED: u8 = 0x8u8;
+pub(pkg) const PRIORITY_FLAG: u8 = 0x20u8;
+
+// Error codes (section 7).
+pub(pkg) const NO_ERROR: u32 = 0x0u32;
+pub(pkg) const PROTOCOL_ERROR: u32 = 0x1u32;
+pub(pkg) const INTERNAL_ERROR: u32 = 0x2u32;
+pub(pkg) const FLOW_CONTROL_ERROR: u32 = 0x3u32;
+pub(pkg) const STREAM_CLOSED: u32 = 0x5u32;
+pub(pkg) const FRAME_SIZE_ERROR: u32 = 0x6u32;
+pub(pkg) const REFUSED_STREAM: u32 = 0x7u32;
+pub(pkg) const CANCEL: u32 = 0x8u32;
+pub(pkg) const COMPRESSION_ERROR: u32 = 0x9u32;
+pub(pkg) const ENHANCE_YOUR_CALM: u32 = 0xbu32;
+
+// Settings (section 6.5.2).
+pub(pkg) const S_HEADER_TABLE_SIZE: u16 = 1u16;
+pub(pkg) const S_ENABLE_PUSH: u16 = 2u16;
+pub(pkg) const S_MAX_CONCURRENT_STREAMS: u16 = 3u16;
+pub(pkg) const S_INITIAL_WINDOW_SIZE: u16 = 4u16;
+pub(pkg) const S_MAX_FRAME_SIZE: u16 = 5u16;
+pub(pkg) const S_MAX_HEADER_LIST_SIZE: u16 = 6u16;
+
+pub(pkg) const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+pub(pkg) const MAX_WINDOW: i64 = 2147483647i64;
+
+/// A connection error: GOAWAY with `code`.
+pub(pkg) fn conn_err(code: u32, msg: str) -> HttpError { HttpError { kind: ErrorKind::Protocol, message: msg, code: code } }
+
+pub(pkg) struct Frame {
+    pub typ: u8;
+    pub flags: u8;
+    pub sid: u32;
+    pub payload: List<u8>;
+}
+
+impl Frame {
+    pub fn has(self, flag: u8) -> bool { self.flags & flag != 0u8 }
+}
+
+pub(pkg) fn u32_at(b: List<u8>, i: usize) -> u32 {
+    (b[i] as u32) << 24u32 | (b[i + 1] as u32) << 16u32 | (b[i + 2] as u32) << 8u32 | b[i + 3] as u32
+}
+
+pub(pkg) fn push_u32(out: List<u8>, v: u32) {
+    out.push((v >> 24u32) as u8);
+    out.push((v >> 16u32) as u8);
+    out.push((v >> 8u32) as u8);
+    out.push(v as u8);
+}
+
+/// Append a frame to `out`.
+pub(pkg) fn put(out: List<u8>, typ: u8, flags: u8, sid: u32, payload: Slice<u8>) {
+    let n = payload.len();
+    out.push((n >> 16) as u8);
+    out.push((n >> 8) as u8);
+    out.push(n as u8);
+    out.push(typ);
+    out.push(flags);
+    push_u32(out, sid & 0x7FFFFFFFu32);
+    out.extend(payload);
+}
+
+pub(pkg) fn frame(typ: u8, flags: u8, sid: u32, payload: List<u8>) -> List<u8> {
+    let out: List<u8> = List::with_capacity(9 + payload.len());
+    put(out, typ, flags, sid, payload[0:payload.len()]);
+    out
+}
+
+pub(pkg) fn rst(sid: u32, code: u32) -> List<u8> {
+    let p: List<u8> = List::new();
+    push_u32(p, code);
+    frame(RST_STREAM, 0u8, sid, p)
+}
+
+pub(pkg) fn goaway(last: u32, code: u32, msg: str) -> List<u8> {
+    let p: List<u8> = List::new();
+    push_u32(p, last);
+    push_u32(p, code);
+    p.extend(msg.as_bytes());
+    frame(GOAWAY, 0u8, 0u32, p)
+}
+
+pub(pkg) fn window_update(sid: u32, inc: u32) -> List<u8> {
+    let p: List<u8> = List::new();
+    push_u32(p, inc);
+    frame(WINDOW_UPDATE, 0u8, sid, p)
+}
+
+pub(pkg) fn settings(pairs: List<(u16, u32)>) -> List<u8> {
+    let p: List<u8> = List::new();
+    for (k, v) in pairs {
+        p.push((k >> 8u16) as u8);
+        p.push(k as u8);
+        push_u32(p, v);
+    }
+    frame(SETTINGS, 0u8, 0u32, p)
+}
+
+/// The next frame, or `none` at a clean end of stream. A frame longer
+/// than `max` is a FRAME_SIZE_ERROR.
+pub(pkg) async fn read(io: Io, max: u32, deadline: Instant | none) throws (HttpError) -> Frame | none {
+    while io.buffered() < 9 {
+        if !(try await io.fill(deadline)) {
+            if io.buffered() == 0 { return none; }
+            throw HttpError::new(ErrorKind::Closed, "connection closed mid-frame");
+        }
+    }
+    let h = io.peek();
+    let len = (h[0] as u32) << 16u32 | (h[1] as u32) << 8u32 | h[2] as u32;
+    let typ = h[3];
+    let flags = h[4];
+    let sid = ((h[5] as u32) << 24u32 | (h[6] as u32) << 16u32 | (h[7] as u32) << 8u32 | h[8] as u32) & 0x7FFFFFFFu32;
+    if len > max { throw conn_err(FRAME_SIZE_ERROR, f"frame of {len} bytes"); }
+    try await io.need(9 + len as usize, deadline);
+    io.consume(9);
+    Frame { typ: typ, flags: flags, sid: sid, payload: io.take(len as usize) }
+}
+
+/// The payload of a DATA / HEADERS frame without its padding (6.1).
+pub(pkg) fn unpad(f: Frame) throws (HttpError) -> List<u8> {
+    if !f.has(PADDED) { return f.payload; }
+    if f.payload.is_empty() { throw conn_err(PROTOCOL_ERROR, "padded frame without pad length"); }
+    let pad = f.payload[0] as usize;
+    if pad + 1 > f.payload.len() { throw conn_err(PROTOCOL_ERROR, "padding longer than the frame"); }
+    f.payload[1:f.payload.len() - pad].to_list()
+}
+
+/// RFC 9218 priority: urgency 0..=7 (default 3) and incremental.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(pkg) struct Prio {
+    pub urgency: u8 = 3u8;
+    pub incremental: bool = false;
+}
+
+/// Parse a `priority` field value (a structured-field dictionary;
+/// unknown members and invalid values are ignored).
+pub(pkg) fn parse_priority(v: str) -> Prio {
+    let p = Prio {};
+    for m in v.split(",") {
+        let t = m.trim();
+        let (k, val) = t.split_once("=") ?? (t, "?1");
+        let key = k.trim();
+        let x = val.trim();
+        if key == "u" && x.len() == 1 {
+            let b = x.byte(0);
+            if b >= 0x30u8 && b <= 0x37u8 { p.urgency = b - 0x30u8; }
+        } else if key == "i" {
+            if x == "?1" { p.incremental = true; } else if x == "?0" { p.incremental = false; }
+        }
+    }
+    p
+}

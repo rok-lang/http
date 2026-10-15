@@ -1,0 +1,177 @@
+// HTTP/2: priority parsing, loopback client and server (h2c), protocol
+// errors on the wire.
+
+use rok::std::net::Shutdown;
+use pkg::*;
+use pkg::h2::frame;
+use pkg::h2::frame::{parse_priority, u32_at};
+use pkg::h2::hpack::Encoder;
+use sup::expect;
+use sup::h1::{start, test_handler};
+
+#[test]
+fn priority_fields() {
+    let p = parse_priority("u=1, i");
+    expect(p.urgency == 1u8 && p.incremental, "u=1, i");
+    let d = parse_priority("");
+    expect(d.urgency == 3u8 && !d.incremental, "default");
+    let q = parse_priority("u=9, i=?0, x=1");
+    expect(q.urgency == 3u8 && !q.incremental, "invalid urgency ignored");
+}
+
+fn h2_client() -> Client { Client::new(ClientConfig { version: Version::Http2 }) }
+
+#[test]
+fn loopback_h2() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let c = h2_client();
+        let r = try! await c.get(base + "/hi?x=1");
+        expect(r.version == Version::Http2 && r.status == StatusCode::OK, "status");
+        let t = try! await r.body.text();
+        expect(t.starts_with("GET /hi?x=1 HTTP/2 host=127.0.0.1:"), t);
+        let e = try! await c.send((try! Request::post(base + "/echo")).text("ping"));
+        expect((try! await e.body.text()) == "ping" && e.headers.get("x-method") == "POST", "echo");
+        // 200 KB: more than the default 64 KB window, so flow control runs.
+        let big = try! await c.get(base + "/big");
+        let bb = try! await big.body.bytes();
+        expect(bb.len() == 200000 && bb[199999] == (199999 % 251) as u8, f"big {bb.len()}");
+        let s = try! await c.get(base + "/stream");
+        expect((try! await s.body.text()).lines().count() == 50, "stream");
+        let h = try! await c.send(try! Request::head(base + "/big"));
+        expect(h.headers.get("content-length") == "200000" && (try! await h.body.bytes()).is_empty(), "HEAD");
+        // Upload bigger than the server's stream window.
+        let up: List<u8> = List::with_capacity(3000000);
+        for i in 0..3000000 { up.push((i % 7) as u8); }
+        let u = try! await c.send((try! Request::post(base + "/echo")).with_body(Body::from_bytes(up)));
+        expect((try! await u.body.bytes()).len() == 3000000, "upload");
+        // Concurrent streams on one connection.
+        let tasks: List<Task<bool>> = List::new();
+        for i in 0..20 {
+            tasks.push(task::spawn(async {
+                let r = try! await c.get(base + f"/n{i}");
+                (try! await r.body.text()).starts_with(f"GET /n{i} ")
+            }));
+        }
+        let ok = 0;
+        for x in await task::join(tasks) {
+            if x { ok += 1; }
+        }
+        expect(ok == 20, f"concurrent {ok}");
+        let r2 = try! await c.get(base + "/redirect");
+        expect((try! await r2.body.text()).starts_with("GET /final?from=r HTTP/2"), "redirect over h2");
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn h2_graceful_shutdown() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let c = h2_client();
+        try! await (try! await c.get(base + "/")).body.bytes();
+        let slow = task::spawn(async { (try! await c.get(base + "/slow")).status.as_u16() });
+        await task::sleep(Duration::ms(100));
+        await srv.shutdown();
+        expect((await slow) == 200u16, "in-flight stream completed after GOAWAY");
+    });
+}
+
+// ---- protocol errors on the wire ----
+
+/// `(type, stream, error code)` of each frame the server sent; the code
+/// is that of RST_STREAM / GOAWAY.
+async fn exchange(base: str, frames: List<u8>) -> List<(u8, u32, u32)> {
+    let s = try! await rok::std::net::tcp_connect_async(base.strip_prefix("http://") ?? base);
+    let out = frame::PREFACE.as_bytes().to_list();
+    out.extend(frames);
+    try! await s.write_all_async(out);
+    // Give the server time to answer before the half-close.
+    await task::sleep(Duration::ms(100));
+    try! s.shutdown(Shutdown::Write);
+    let back = try! await s.read_to_end_async();
+    s.close();
+    let got: List<(u8, u32, u32)> = List::new();
+    let i = 0usize;
+    while i + 9 <= back.len() {
+        let len = (back[i] as usize) << 16 | (back[i + 1] as usize) << 8 | back[i + 2] as usize;
+        let typ = back[i + 3];
+        let sid = u32_at(back, i + 5);
+        let code = 0u32;
+        if typ == frame::RST_STREAM { code = u32_at(back, i + 9); }
+        if typ == frame::GOAWAY { code = u32_at(back, i + 13); }
+        got.push((typ, sid, code));
+        i += 9 + len;
+    }
+    got
+}
+
+fn has(got: List<(u8, u32, u32)>, typ: u8, code: u32) -> bool {
+    for (t, _, c) in got {
+        if t == typ && c == code { return true; }
+    }
+    false
+}
+
+fn settings0() -> List<u8> { frame::settings(List::new()) }
+
+fn headers(sid: u32, fields: List<(str, str)>, flags: u8) -> List<u8> {
+    frame::frame(frame::HEADERS, flags | frame::END_HEADERS, sid, Encoder::new(false).encode(fields))
+}
+
+fn get_fields(path: str) -> List<(str, str)> { [(":method", "GET"), (":scheme", "http"), (":authority", "a"), (":path", path)] }
+
+fn cat(parts: List<List<u8>>) -> List<u8> {
+    let out: List<u8> = List::new();
+    for p in parts { out.extend(p); }
+    out
+}
+
+#[test]
+fn h2_wire_errors() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let goaway = frame::GOAWAY;
+        let rst = frame::RST_STREAM;
+        // A good request first: the server answers HEADERS + DATA.
+        let ok = await exchange(base, cat([settings0(), headers(1u32, get_fields("/x"), frame::END_STREAM)]));
+        expect(has(ok, frame::HEADERS, 0u32) && has(ok, frame::DATA, 0u32), f"{ok:?}");
+        let e1 = await exchange(base, frame::frame(frame::PING, 0u8, 0u32, [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]));
+        expect(has(e1, goaway, frame::PROTOCOL_ERROR), f"first frame not SETTINGS {e1:?}");
+        let e2 = await exchange(base, cat([settings0(), frame::frame(frame::DATA, 0u8, 0u32, [1u8])]));
+        expect(has(e2, goaway, frame::PROTOCOL_ERROR), "DATA on stream 0");
+        let e3 = await exchange(base, cat([settings0(), headers(2u32, get_fields("/"), frame::END_STREAM)]));
+        expect(has(e3, goaway, frame::PROTOCOL_ERROR), "even stream id");
+        let e4 = await exchange(base, cat([settings0(), frame::window_update(0u32, 0u32)]));
+        expect(has(e4, goaway, frame::PROTOCOL_ERROR), "zero window update");
+        let huge: List<u8> = List::new();
+        for _ in 0..16385 { huge.push(0u8); }
+        let e5 = await exchange(base, cat([settings0(), frame::frame(frame::DATA, 0u8, 1u32, huge)]));
+        expect(has(e5, goaway, frame::FRAME_SIZE_ERROR), "oversized frame");
+        let e6 = await exchange(base, cat([settings0(), headers(1u32, [(":method", "GET"), (":scheme", "http"), (":path", "/"), ("X-Upper", "1")], frame::END_STREAM)]));
+        expect(has(e6, rst, frame::PROTOCOL_ERROR) && !has(e6, goaway, frame::PROTOCOL_ERROR), "uppercase field: stream error");
+        let e7 = await exchange(base, cat([settings0(), headers(1u32, [(":method", "GET"), (":scheme", "http"), (":path", "/"), ("connection", "close")], frame::END_STREAM)]));
+        expect(has(e7, rst, frame::PROTOCOL_ERROR), "connection-specific field");
+        let e8 = await exchange(base, cat([settings0(), frame::frame(frame::CONTINUATION, frame::END_HEADERS, 1u32, [0x82u8])]));
+        expect(has(e8, goaway, frame::PROTOCOL_ERROR), "CONTINUATION without HEADERS");
+        let e9 = await exchange(base, cat([settings0(), frame::frame(frame::HEADERS, frame::END_HEADERS | frame::END_STREAM, 1u32, [0x80u8])]));
+        expect(has(e9, goaway, frame::COMPRESSION_ERROR), "bad HPACK");
+        let e10 = await exchange(base, cat([settings0(), headers(1u32, [(":method", "GET"), (":path", "/")], frame::END_STREAM)]));
+        expect(has(e10, rst, frame::PROTOCOL_ERROR), "missing :scheme");
+        let e11 = await exchange(base, cat([settings0(), headers(1u32, get_fields("/echo"), 0u8), headers(3u32, get_fields("/"), 0u8), frame::frame(frame::CONTINUATION, frame::END_HEADERS, 1u32, [0x82u8])]));
+        expect(has(e11, goaway, frame::PROTOCOL_ERROR), "CONTINUATION on a finished block");
+        let post = [(":method", "POST"), (":scheme", "http"), (":authority", "a"), (":path", "/echo"), ("content-length", "3")];
+        let e12 = await exchange(base, cat([settings0(), headers(1u32, post, 0u8), frame::frame(frame::DATA, frame::END_STREAM, 1u32, [1u8, 2u8])]));
+        expect(has(e12, rst, frame::PROTOCOL_ERROR), "content-length mismatch");
+        let e13 = await exchange(base, cat([settings0(), headers(1u32, get_fields("/"), frame::END_STREAM), headers(1u32, get_fields("/"), frame::END_STREAM)]));
+        expect(has(e13, goaway, frame::STREAM_CLOSED) || has(e13, rst, frame::STREAM_CLOSED), "HEADERS on a closed stream");
+        let e14 = await exchange(base, cat([settings0(), frame::settings([(frame::S_INITIAL_WINDOW_SIZE, 0x80000000u32)])]));
+        expect(has(e14, goaway, frame::FLOW_CONTROL_ERROR), "window setting too large");
+        let e15 = await exchange(base, cat([settings0(), frame::frame(frame::PUSH_PROMISE, frame::END_HEADERS, 1u32, [0u8, 0u8, 0u8, 2u8])]));
+        expect(has(e15, goaway, frame::PROTOCOL_ERROR), "PUSH_PROMISE from a client");
+        // PING is answered.
+        let p = await exchange(base, cat([settings0(), frame::frame(frame::PING, 0u8, 0u32, [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8])]));
+        expect(has(p, frame::PING, 0u32), "PING ACK");
+        await srv.shutdown();
+    });
+}

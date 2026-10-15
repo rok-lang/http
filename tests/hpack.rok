@@ -1,0 +1,181 @@
+// HPACK: the examples of RFC 7541 Appendix C, both directions.
+
+use pkg::h2::hpack::{Decoder, Encoder, put_int};
+use pkg::h2::huffman;
+use sup::expect;
+
+fn hex(s: str) -> List<u8> {
+    let out: List<u8> = List::new();
+    let digits: List<u8> = List::new();
+    for b in s.bytes() {
+        if b != 0x20u8 && b != 0x0Au8 { digits.push(b); }
+    }
+    let i = 0usize;
+    while i + 1 < digits.len() {
+        out.push(nib(digits[i]) * 16u8 + nib(digits[i + 1]));
+        i += 2;
+    }
+    out
+}
+
+fn nib(b: u8) -> u8 { if b >= 0x61u8 { b - 0x61u8 + 10u8 } else { b - 0x30u8 } }
+
+fn to_hex(b: List<u8>) -> str {
+    let o = StrBuf::new();
+    for x in b { o.push_str(f"{x:02x}"); }
+    o.to_str()
+}
+
+struct Step {
+    block: str;
+    fields: List<(str, str)>;
+    size: usize;
+}
+
+/// Decode each block and compare fields and table size; encode the
+/// fields and compare bytes.
+fn series(table: usize, huff: bool, steps: List<Step>) {
+    let d = Decoder::new(table);
+    let e = Encoder::new(huff);
+    e.table.set_max(table);
+    let k = 0;
+    for s in steps {
+        let b = hex(s.block);
+        let got = try d.decode(b) catch err { panic(f"step {k}: {err}"); };
+        expect(got == s.fields, f"step {k}: fields {got:?}");
+        expect(d.table.size() == s.size, f"step {k}: table size {d.table.size()}");
+        let enc = e.encode(s.fields);
+        expect(enc == b, f"step {k}: encoded {to_hex(enc)}, want {to_hex(b)}");
+        k += 1;
+    }
+}
+
+fn req1() -> List<(str, str)> { [(":method", "GET"), (":scheme", "http"), (":path", "/"), (":authority", "www.example.com")] }
+
+fn req2() -> List<(str, str)> {
+    [(":method", "GET"), (":scheme", "http"), (":path", "/"), (":authority", "www.example.com"), ("cache-control", "no-cache")]
+}
+
+fn req3() -> List<(str, str)> {
+    [(":method", "GET"), (":scheme", "https"), (":path", "/index.html"), (":authority", "www.example.com"), ("custom-key", "custom-value")]
+}
+
+fn resp1() -> List<(str, str)> {
+    [(":status", "302"), ("cache-control", "private"), ("date", "Mon, 21 Oct 2013 20:13:21 GMT"), ("location", "https://www.example.com")]
+}
+
+fn resp2() -> List<(str, str)> {
+    [(":status", "307"), ("cache-control", "private"), ("date", "Mon, 21 Oct 2013 20:13:21 GMT"), ("location", "https://www.example.com")]
+}
+
+fn resp3() -> List<(str, str)> {
+    [
+        (":status", "200"), ("cache-control", "private"), ("date", "Mon, 21 Oct 2013 20:13:22 GMT"),
+        ("location", "https://www.example.com"), ("content-encoding", "gzip"),
+        ("set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"),
+    ]
+}
+
+#[test]
+fn integers_c1() {
+    let a: List<u8> = List::new();
+    put_int(a, 0u8, 5u32, 10usize);
+    expect(a == [0x0Au8], "C.1.1");
+    let b: List<u8> = List::new();
+    put_int(b, 0u8, 5u32, 1337usize);
+    expect(b == [0x1Fu8, 0x9Au8, 0x0Au8], "C.1.2");
+    let c: List<u8> = List::new();
+    put_int(c, 0u8, 8u32, 42usize);
+    expect(c == [0x2Au8], "C.1.3");
+}
+
+#[test]
+fn literals_c2() {
+    let d = Decoder::new();
+    expect(try! d.decode(hex("400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572")) == [("custom-key", "custom-header")], "C.2.1");
+    expect(d.table.size() == 55usize, "C.2.1 size");
+    let d2 = Decoder::new();
+    expect(try! d2.decode(hex("040c 2f73 616d 706c 652f 7061 7468")) == [(":path", "/sample/path")] && d2.table.len() == 0usize, "C.2.2");
+    let d3 = Decoder::new();
+    expect(try! d3.decode(hex("1008 7061 7373 776f 7264 0673 6563 7265 74")) == [("password", "secret")] && d3.table.len() == 0usize, "C.2.3");
+    expect(try! Decoder::new().decode(hex("82")) == [(":method", "GET")], "C.2.4");
+}
+
+#[test]
+fn requests_c3_c4() {
+    series(4096, false, [
+        Step { block: "8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d", fields: req1(), size: 57 },
+        Step { block: "8286 84be 5808 6e6f 2d63 6163 6865", fields: req2(), size: 110 },
+        Step { block: "8287 85bf 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65", fields: req3(), size: 164 },
+    ]);
+    series(4096, true, [
+        Step { block: "8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff", fields: req1(), size: 57 },
+        Step { block: "8286 84be 5886 a8eb 1064 9cbf", fields: req2(), size: 110 },
+        Step { block: "8287 85bf 4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf", fields: req3(), size: 164 },
+    ]);
+}
+
+#[test]
+fn responses_c5_c6() {
+    series(256, false, [
+        Step {
+            block: "4803 3330 3258 0770 7269 7661 7465 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3120 474d 546e 1768 7474 7073 3a2f 2f77 7777 2e65 7861 6d70 6c65 2e63 6f6d",
+            fields: resp1(),
+            size: 222,
+        },
+        Step { block: "4803 3330 37c1 c0bf", fields: resp2(), size: 222 },
+        Step {
+            block: "88c1 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3220 474d 54c0 5a04 677a 6970 7738 666f 6f3d 4153 444a 4b48 514b 425a 584f 5157 454f 5049 5541 5851 5745 4f49 553b 206d 6178 2d61 6765 3d33 3630 303b 2076 6572 7369 6f6e 3d31",
+            fields: resp3(),
+            size: 215,
+        },
+    ]);
+    series(256, true, [
+        Step {
+            block: "4882 6402 5885 aec3 771a 4b61 96d0 7abe 9410 54d4 44a8 2005 9504 0b81 66e0 82a6 2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 e9ae 82ae 43d3",
+            fields: resp1(),
+            size: 222,
+        },
+        Step { block: "4883 640e ffc1 c0bf", fields: resp2(), size: 222 },
+        Step {
+            block: "88c1 6196 d07a be94 1054 d444 a820 0595 040b 8166 e084 a62d 1bff c05a 839b d9ab 77ad 94e7 821d d7f2 e6c7 b335 dfdf cd5b 3960 d5af 2708 7f36 72c1 ab27 0fb5 291f 9587 3160 65c0 03ed 4ee5 b106 3d50 07",
+            fields: resp3(),
+            size: 215,
+        },
+    ]);
+}
+
+#[test]
+fn malformed_blocks() {
+    let bad = [
+        "80",               // index 0
+        "be",               // empty dynamic table
+        "ff80808080808001", // integer overflow
+        "400a 6375 7374",   // truncated literal
+        "3fe21f",           // size update over the 4096 limit
+        "82 20",            // size update after a field
+        "4081ff 00",        // Huffman padding over 7 bits (an all-ones byte)
+        "4084 ffff ffff 00", // EOS in a Huffman string
+    ];
+    for b in bad {
+        expect((try? Decoder::new().decode(hex(b))) is none, f"reject {b}");
+    }
+    let small = Decoder::new();
+    expect((try? small.decode(hex("400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572"), 40usize)) is none, "list limit");
+}
+
+#[test]
+fn huffman_round_trip() {
+    let s = "Hello, HPACK! 0123456789 ~\u{7f}\u{0} é";
+    let enc: List<u8> = List::new();
+    huffman::encode(s.as_bytes(), enc);
+    let dec = try! huffman::decode(enc[0:enc.len()]);
+    expect(dec == s.as_bytes().to_list(), "round trip");
+    // A size update is announced at the start of the next block.
+    let e = Encoder::new();
+    e.set_max(0usize);
+    let blk = e.encode([("x-a", "b")]);
+    expect(blk[0] == 0x20u8 && e.table.len() == 0usize, "size update then no indexing");
+    let d = Decoder::new();
+    expect(try! d.decode(blk) == [("x-a", "b")] && d.table.max_size() == 0usize, "decoded");
+}

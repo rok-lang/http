@@ -190,6 +190,7 @@ impl Server {
                 let (dtx, drx) = channel::<i32>();
                 self.set_entry(id, ConnEntry { s: s, idle: false, drain: dtx });
                 await h2::serve_conn(io, self.handler, self.cfg.h2, drx);
+                dtx.close();
             } else {
                 await self.serve_h1(io, id);
             }

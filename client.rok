@@ -53,7 +53,7 @@ pub async fn get(url: str) throws (HttpError) -> Response { try await Client::ne
 
 /// The marker of a failure before the request reached a server: an
 /// idle pooled connection the server had closed.
-const STALE: str = "connection closed before the response";
+pub(pkg) const STALE: str = "connection closed before the response";
 
 impl Client {
     pub fn new(cfg: ClientConfig | none = none) -> Client {
@@ -114,7 +114,15 @@ impl Client {
         let deadline = deadline_in(self.cfg.timeout);
         if self.cfg.version == Version::Http2 {
             let c = try await self.h2_conn(key, host, port, deadline);
-            return try await c.send(req, deadline);
+            let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
+            let r = try await c.send(req, deadline) catch e: HttpError {
+                if !(replayable && e.message == STALE) { throw e; }
+                // Refused by GOAWAY or a closed connection: once more on a new one.
+                if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
+                let fresh = try await self.h2_conn(key, host, port, deadline);
+                return try await fresh.send(req, deadline);
+            };
+            return r;
         }
         if let io: Io = self.checkout(key) {
             let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
