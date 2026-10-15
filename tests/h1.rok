@@ -208,9 +208,9 @@ fn redirects_and_timeouts() {
         let manual = try! await Client::new(ClientConfig { max_redirects: 0u32 }).get(base + "/redirect");
         expect(manual.status == StatusCode::FOUND, "not followed");
         let quick = Client::new(ClientConfig { timeout: Duration::ms(100) });
-        expect((await err_kind(quick, base + "/slow")) == ErrorKind::Timeout, "timeout");
-        expect((await err_kind(c, "http://127.0.0.1:1/")) == ErrorKind::Io, "refused");
-        expect((await err_kind(c, "https://example.com/")) == ErrorKind::Unsupported, "no TLS yet");
+        expect(await err_kind(quick, base + "/slow") == ErrorKind::Timeout, "timeout");
+        expect(await err_kind(c, "http://127.0.0.1:1/") == ErrorKind::Io, "refused");
+        expect(await err_kind(c, "https://example.com/") == ErrorKind::Unsupported, "no TLS yet");
         await srv.shutdown();
     });
 }
@@ -267,7 +267,7 @@ fn body_limit_and_graceful_shutdown() {
         let slow = task::spawn(async { (try! await c.get(base + "/slow")).status.as_u16() });
         await task::sleep(Duration::ms(100));
         await srv.shutdown();
-        expect((await slow) == 200u16, "in-flight request completed");
-        expect((await err_kind(Client::new(), base + "/")) == ErrorKind::Io, "listener closed");
+        expect(await slow == 200u16, "in-flight request completed");
+        expect(await err_kind(Client::new(), base + "/") == ErrorKind::Io, "listener closed");
     });
 }

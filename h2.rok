@@ -572,7 +572,7 @@ impl Shared {
             match c {
                 b: List<u8> => {
                     self.cmd(Cmd::Data(sid, b, false, atx));
-                    if ((await arx.recv_async()) ?? -1) != 0 { return; }
+                    if (await arx.recv_async() ?? -1) != 0 { return; }
                 },
                 none => {
                     self.cmd(Cmd::Data(sid, List::new(), true, none));
@@ -786,7 +786,7 @@ pub(pkg) async fn serve_conn(io: Io, handler: Handler, cfg: Config, drain: Recei
     io.consume(frame::PREFACE.len());
     let sh = Shared::new(io.s, cfg, true);
     task::spawn(async {
-        if (await drain.recv_async()) is i32 { sh.drain(); }
+        if await drain.recv_async() is i32 { sh.drain(); }
         0
     });
     await sh.read_loop(io, handler);
