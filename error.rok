@@ -1,0 +1,45 @@
+// The one error type of the package.
+
+/// What went wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorKind {
+    /// Malformed input: a URI, a header, a message head.
+    Parse,
+    /// The peer broke the protocol (HTTP/2 error code in `code`).
+    Protocol,
+    /// A size limit was exceeded.
+    TooLarge,
+    /// A deadline passed.
+    Timeout,
+    /// The connection or stream closed before the message was complete.
+    Closed,
+    /// The peer reset the stream (HTTP/2 error code in `code`).
+    Reset,
+    /// Too many redirects, or a redirect that cannot be followed.
+    Redirect,
+    /// Something this library does not do (an `https` URL before TLS).
+    Unsupported,
+    /// A socket error.
+    Io,
+}
+
+/// An HTTP failure: its kind, a message and, for HTTP/2 errors, the
+/// RFC 9113 error code (`0` otherwise).
+#[derive(Clone, Debug)]
+pub struct HttpError {
+    pub kind: ErrorKind;
+    pub message: str;
+    pub code: u32 = 0u32;
+}
+
+impl HttpError {
+    pub fn new(kind: ErrorKind, message: str) -> HttpError { HttpError { kind: kind, message: message } }
+}
+
+impl Display for HttpError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.message) }
+}
+
+impl Error for HttpError {}
+
+pub(pkg) fn parse_err(msg: str) -> HttpError { HttpError::new(ErrorKind::Parse, msg) }

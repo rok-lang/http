@@ -1,0 +1,470 @@
+// URIs (RFC 3986): parsing, normalization, reference resolution,
+// percent-encoding and `application/x-www-form-urlencoded`.
+
+use rok::std::net::Ipv6Addr;
+use pkg::error::{HttpError, parse_err};
+
+/// A URI reference. `scheme` is `""` and `host` is `none` for a
+/// relative reference (`/a?b`). `host` keeps an IPv6 literal without
+/// its brackets. Components keep their percent-encoding.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Uri {
+    pub scheme: str = "";
+    pub userinfo: str | none = none;
+    pub host: str | none = none;
+    pub port: u16 | none = none;
+    pub path: str = "";
+    pub query: str | none = none;
+    pub fragment: str | none = none;
+}
+
+impl Uri {
+    /// Parse a URI reference strictly: every character must be allowed
+    /// in its component and every `%` must start a `%XX` escape.
+    pub fn parse(s: str) throws (HttpError) -> Uri {
+        let u = Uri {};
+        let rest = s;
+        if let c: usize = scheme_end(s) {
+            u.scheme = s[:c];
+            rest = s[c + 1:];
+        }
+        if let k: usize = rest.find("#") {
+            let frag = rest[k + 1:];
+            try check_chars(frag, "/?:@", "fragment");
+            u.fragment = frag;
+            rest = rest[:k];
+        }
+        if let k: usize = rest.find("?") {
+            let q = rest[k + 1:];
+            try check_chars(q, "/?:@", "query");
+            u.query = q;
+            rest = rest[:k];
+        }
+        if rest.starts_with("//") {
+            let a = rest[2:];
+            let end = a.find("/") ?? a.len();
+            try parse_authority(ref u, a[:end]);
+            rest = a[end:];
+        } else if u.scheme.is_empty() {
+            // A relative path's first segment must not look like a scheme.
+            let seg = rest[:rest.find("/") ?? rest.len()];
+            if seg.contains(":") { throw parse_err(f"invalid URI {s:?}"); }
+        }
+        try check_chars(rest, "/:@", "path");
+        u.path = rest;
+        u
+    }
+
+    pub fn is_absolute(self) -> bool { !self.scheme.is_empty() }
+
+    /// `host[:port]` as a `Host` header / `:authority` value (no
+    /// userinfo); `""` without a host.
+    pub fn authority(self) -> str {
+        let h = match self.host {
+            h: str => if h.contains(":") { f"[{h}]" } else { h },
+            none => return "",
+        };
+        match self.port {
+            p: u16 => f"{h}:{p}",
+            none => h,
+        }
+    }
+
+    /// The port, or the scheme's default (80 / 443); `none` if neither.
+    pub fn port_or_default(self) -> u16 | none {
+        if let p: u16 = self.port { return p; }
+        default_port(self.scheme)
+    }
+
+    /// Path and query as a request target (`/` for an empty path).
+    pub fn path_and_query(self) -> str {
+        let p = if self.path.is_empty() { "/" } else { self.path };
+        match self.query {
+            q: str => f"{p}?{q}",
+            none => p,
+        }
+    }
+
+    /// The query as `(name, value)` pairs (form-decoded).
+    pub fn query_pairs(self) -> List<(str, str)> {
+        match self.query {
+            q: str => form_decode(q),
+            none => List::new(),
+        }
+    }
+
+    /// The syntax-based normalization of RFC 3986 6.2.2 plus the
+    /// scheme-based one for http / https: lowercase scheme and host,
+    /// uppercase escapes, unreserved characters decoded, dot segments
+    /// removed, a default port dropped, an empty path made `/`.
+    pub fn normalize(self) -> Uri {
+        let u = self;
+        u.scheme = self.scheme.to_lowercase();
+        if let h: str = self.host { u.host = norm_pct(h).to_lowercase(); }
+        if let ui: str = self.userinfo { u.userinfo = norm_pct(ui); }
+        u.path = remove_dot_segments(norm_pct(self.path));
+        if let q: str = self.query { u.query = norm_pct(q); }
+        if let fr: str = self.fragment { u.fragment = norm_pct(fr); }
+        if u.scheme == "http" || u.scheme == "https" {
+            if let p: u16 = u.port {
+                if default_port(u.scheme) == p { u.port = none; }
+            }
+            if u.host is str && u.path.is_empty() { u.path = "/"; }
+        }
+        u
+    }
+
+    /// Resolve `reference` against this base URI (RFC 3986 5.2.2).
+    pub fn resolve(self, reference: Uri) -> Uri {
+        let r = reference;
+        let t = Uri {};
+        if r.is_absolute() {
+            t = r;
+            t.path = remove_dot_segments(r.path);
+            return t;
+        }
+        t.scheme = self.scheme;
+        t.fragment = r.fragment;
+        if r.host is str {
+            t.userinfo = r.userinfo;
+            t.host = r.host;
+            t.port = r.port;
+            t.path = remove_dot_segments(r.path);
+            t.query = r.query;
+            return t;
+        }
+        t.userinfo = self.userinfo;
+        t.host = self.host;
+        t.port = self.port;
+        if r.path.is_empty() {
+            t.path = self.path;
+            t.query = r.query ?? self.query;
+        } else {
+            if r.path.starts_with("/") {
+                t.path = remove_dot_segments(r.path);
+            } else {
+                t.path = remove_dot_segments(merge(self, r.path));
+            }
+            t.query = r.query;
+        }
+        t
+    }
+
+    /// Resolve the reference text `s` against this URI.
+    pub fn join(self, s: str) throws (HttpError) -> Uri { self.resolve(try Uri::parse(s)) }
+}
+
+impl Display for Uri {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let out = StrBuf::new();
+        if !self.scheme.is_empty() {
+            out.push_str(self.scheme);
+            out.push(':');
+        }
+        if self.host is str {
+            out.push_str("//");
+            if let ui: str = self.userinfo {
+                out.push_str(ui);
+                out.push('@');
+            }
+            out.push_str(self.authority());
+        }
+        out.push_str(self.path);
+        if let q: str = self.query {
+            out.push('?');
+            out.push_str(q);
+        }
+        if let fr: str = self.fragment {
+            out.push('#');
+            out.push_str(fr);
+        }
+        try f.write_str(out.to_str())
+    }
+}
+
+fn default_port(scheme: str) -> u16 | none {
+    let s = scheme.to_lowercase();
+    if s == "http" { return 80u16; }
+    if s == "https" { return 443u16; }
+    none
+}
+
+/// Index of the `:` ending a valid scheme, if `s` starts with one.
+fn scheme_end(s: str) -> usize | none {
+    let i = 0usize;
+    for b in s.bytes() {
+        if b == 0x3Au8 { return if i > 0 { i } else { none }; }
+        let alpha = b >= 0x61u8 && b <= 0x7Au8 || b >= 0x41u8 && b <= 0x5Au8;
+        if i == 0 && !alpha { return none; }
+        if !alpha && !(b >= 0x30u8 && b <= 0x39u8) && b != 0x2Bu8 && b != 0x2Du8 && b != 0x2Eu8 { return none; }
+        i += 1;
+    }
+    none
+}
+
+fn parse_authority(ref u: Uri, a: str) throws (HttpError) {
+    let hp = a;
+    if let k: usize = a.rfind("@") {
+        let ui = a[:k];
+        try check_chars(ui, ":", "userinfo");
+        u.userinfo = ui;
+        hp = a[k + 1:];
+    }
+    let port_s: str | none = none;
+    if hp.starts_with("[") {
+        let close = hp.find("]") ?? { throw parse_err(f"unclosed IPv6 literal in {a:?}"); };
+        let lit = hp[1:close];
+        try lit.parse::<Ipv6Addr>() catch _ { throw parse_err(f"invalid IPv6 literal {lit:?}"); };
+        u.host = lit.to_lowercase();
+        let after = hp[close + 1:];
+        if !after.is_empty() {
+            if !after.starts_with(":") { throw parse_err(f"invalid authority {a:?}"); }
+            port_s = after[1:];
+        }
+    } else {
+        let h = hp;
+        if let k: usize = hp.rfind(":") {
+            h = hp[:k];
+            port_s = hp[k + 1:];
+        }
+        try check_chars(h, "", "host");
+        u.host = h;
+    }
+    if let p: str = port_s {
+        if p.is_empty() { return; }
+        if p.len() > 5 { throw parse_err(f"invalid port {p:?}"); }
+        let n = 0u32;
+        for b in p.bytes() {
+            if b < 0x30u8 || b > 0x39u8 { throw parse_err(f"invalid port {p:?}"); }
+            n = n * 10u32 + (b - 0x30u8) as u32;
+        }
+        if n > 65535u32 { throw parse_err(f"invalid port {p:?}"); }
+        u.port = n as u16;
+    }
+}
+
+fn is_unreserved(b: u8) -> bool {
+    b >= 0x61u8 && b <= 0x7Au8 || b >= 0x41u8 && b <= 0x5Au8 || b >= 0x30u8 && b <= 0x39u8 || b == 0x2Du8
+        || b == 0x2Eu8 || b == 0x5Fu8 || b == 0x7Eu8
+}
+
+fn is_sub_delim(b: u8) -> bool {
+    b == 0x21u8 || b == 0x24u8 || b == 0x26u8 || b == 0x27u8 || b == 0x28u8 || b == 0x29u8 || b == 0x2Au8
+        || b == 0x2Bu8 || b == 0x2Cu8 || b == 0x3Bu8 || b == 0x3Du8
+}
+
+fn hex_val(b: u8) -> u8 | none {
+    if b >= 0x30u8 && b <= 0x39u8 { return b - 0x30u8; }
+    if b >= 0x61u8 && b <= 0x66u8 { return b - 0x61u8 + 10u8; }
+    if b >= 0x41u8 && b <= 0x46u8 { return b - 0x41u8 + 10u8; }
+    none
+}
+
+/// Every byte of `s` is unreserved, a sub-delim, in `extra`, or part of
+/// a `%XX` escape.
+fn check_chars(s: str, extra: str, what: str) throws (HttpError) {
+    let bs = s.as_bytes();
+    let i = 0usize;
+    while i < bs.len() {
+        let b = bs[i];
+        if b == 0x25u8 {
+            if i + 2 >= bs.len() { throw parse_err(f"bad escape in {what} {s:?}"); }
+            if hex_val(bs[i + 1]) is none || hex_val(bs[i + 2]) is none { throw parse_err(f"bad escape in {what} {s:?}"); }
+            i += 3;
+            continue;
+        }
+        if !is_unreserved(b) && !is_sub_delim(b) && !extra.as_bytes().iter().any(|e| e == b) {
+            throw parse_err(f"invalid character in {what} {s:?}");
+        }
+        i += 1;
+    }
+}
+
+const HEX: str = "0123456789ABCDEF";
+
+fn push_pct(out: List<u8>, b: u8) {
+    out.push(0x25u8);
+    out.push(HEX.byte((b >> 4u8) as usize));
+    out.push(HEX.byte((b & 15u8) as usize));
+}
+
+fn bytes_to_str(bs: List<u8>) -> str { try! str::from_utf8(bs) }
+
+/// Uppercase escapes; decode escapes of unreserved characters.
+fn norm_pct(s: str) -> str {
+    if !s.contains("%") { return s; }
+    let bs = s.as_bytes();
+    let out: List<u8> = List::with_capacity(bs.len());
+    let i = 0usize;
+    while i < bs.len() {
+        if bs[i] == 0x25u8 && i + 2 < bs.len() {
+            if let hi: u8 = hex_val(bs[i + 1]) {
+                if let lo: u8 = hex_val(bs[i + 2]) {
+                    let v = hi * 16u8 + lo;
+                    if is_unreserved(v) { out.push(v); } else { push_pct(out, v); }
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bs[i]);
+        i += 1;
+    }
+    bytes_to_str(out)
+}
+
+/// RFC 3986 5.2.3.
+fn merge(base: Uri, rel: str) -> str {
+    if base.host is str && base.path.is_empty() { return "/" + rel; }
+    match base.path.rfind("/") {
+        k: usize => base.path[:k + 1] + rel,
+        none => rel,
+    }
+}
+
+/// RFC 3986 5.2.4.
+pub fn remove_dot_segments(path: str) -> str {
+    let input = path;
+    let out: List<str> = List::new();
+    while !input.is_empty() {
+        if input.starts_with("../") {
+            input = input[3:];
+        } else if input.starts_with("./") {
+            input = input[2:];
+        } else if input.starts_with("/./") {
+            input = input[2:];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = input[3:];
+            out.pop();
+        } else if input == "/.." {
+            input = "/";
+            out.pop();
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let start = if input.starts_with("/") { 1usize } else { 0usize };
+            let end = match input[start:].find("/") {
+                k: usize => k + start,
+                none => input.len(),
+            };
+            out.push(input[:end]);
+            input = input[end:];
+        }
+    }
+    out.join("")
+}
+
+/// `s` with every byte that is not unreserved and not in `keep` as a
+/// `%XX` escape (UTF-8 bytes each escaped).
+pub fn percent_encode(s: str, keep: str = "") -> str {
+    let out: List<u8> = List::with_capacity(s.len());
+    let k = keep.as_bytes();
+    for b in s.bytes() {
+        if is_unreserved(b) || k.iter().any(|e| e == b) { out.push(b); } else { push_pct(out, b); }
+    }
+    bytes_to_str(out)
+}
+
+/// The bytes `s` encodes; throws on a malformed escape.
+pub fn percent_decode_bytes(s: str) throws (HttpError) -> List<u8> {
+    let bs = s.as_bytes();
+    let out: List<u8> = List::with_capacity(bs.len());
+    let i = 0usize;
+    while i < bs.len() {
+        if bs[i] == 0x25u8 {
+            if i + 2 >= bs.len() { throw parse_err(f"bad escape in {s:?}"); }
+            let hi = hex_val(bs[i + 1]) ?? { throw parse_err(f"bad escape in {s:?}"); };
+            let lo = hex_val(bs[i + 2]) ?? { throw parse_err(f"bad escape in {s:?}"); };
+            out.push(hi * 16u8 + lo);
+            i += 3;
+        } else {
+            out.push(bs[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The text `s` encodes; throws on a malformed escape or invalid UTF-8.
+pub fn percent_decode(s: str) throws (HttpError) -> str {
+    let bs = try percent_decode_bytes(s);
+    try str::from_utf8(bs) catch _ { throw parse_err(f"escapes of {s:?} are not UTF-8"); }
+}
+
+/// `application/x-www-form-urlencoded` (WHATWG URL): `a=1&b=x+y`.
+pub fn form_encode(pairs: List<(str, str)>) -> str {
+    let parts: List<str> = List::with_capacity(pairs.len());
+    for (k, v) in pairs { parts.push(form_part(k) + "=" + form_part(v)); }
+    parts.join("&")
+}
+
+fn form_part(s: str) -> str {
+    let out: List<u8> = List::with_capacity(s.len());
+    for b in s.bytes() {
+        if b == 0x20u8 {
+            out.push(0x2Bu8);
+        } else if b >= 0x61u8 && b <= 0x7Au8 || b >= 0x41u8 && b <= 0x5Au8 || b >= 0x30u8 && b <= 0x39u8
+            || b == 0x2Au8 || b == 0x2Du8 || b == 0x2Eu8 || b == 0x5Fu8 {
+                out.push(b);
+            } else {
+                push_pct(out, b);
+            }
+    }
+    bytes_to_str(out)
+}
+
+/// Decode a form body / query leniently as browsers do: empty pieces
+/// skipped, `+` is a space, a malformed escape stays as written,
+/// invalid UTF-8 becomes U+FFFD.
+pub fn form_decode(s: str) -> List<(str, str)> {
+    let out: List<(str, str)> = List::new();
+    for piece in s.split("&") {
+        if piece.is_empty() { continue; }
+        let (k, v) = piece.split_once("=") ?? (piece, "");
+        out.push((form_unescape(k), form_unescape(v)));
+    }
+    out
+}
+
+fn form_unescape(s: str) -> str {
+    let bs = s.as_bytes();
+    let out: List<u8> = List::with_capacity(bs.len());
+    let i = 0usize;
+    while i < bs.len() {
+        let b = bs[i];
+        if b == 0x2Bu8 {
+            out.push(0x20u8);
+        } else if b == 0x25u8 && i + 2 < bs.len() && hex_val(bs[i + 1]) is u8 && hex_val(bs[i + 2]) is u8 {
+            out.push((hex_val(bs[i + 1]) ?? 0u8) * 16u8 + (hex_val(bs[i + 2]) ?? 0u8));
+            i += 2;
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    utf8_lossy(out)
+}
+
+/// `bs` as text, each byte of an invalid sequence replaced by U+FFFD.
+pub(pkg) fn utf8_lossy(bs: List<u8>) -> str {
+    try str::from_utf8(bs) catch _ {
+        let o = StrBuf::new();
+        let i = 0usize;
+        while i < bs.len() {
+            let b = bs[i];
+            let n = if b < 0x80u8 { 1usize } else if b >= 0xC2u8 && b <= 0xDFu8 { 2usize } else if b >= 0xE0u8 && b <= 0xEFu8 { 3usize } else if b >= 0xF0u8 && b <= 0xF4u8 { 4usize } else { 0usize };
+            if n > 0 && i + n <= bs.len() {
+                if let t: str = try? str::from_utf8(bs[i:i + n]) {
+                    o.push_str(t);
+                    i += n;
+                    continue;
+                }
+            }
+            o.push('\u{FFFD}');
+            i += 1;
+        }
+        o.to_str()
+    }
+}

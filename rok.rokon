@@ -1,0 +1,8 @@
+Package {
+    name: "http",
+    version: "0.1.0",
+    description: "HTTP/1.1 and HTTP/2 client and server: strict parsing, HPACK, streaming bodies, connection pooling",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/rok-lang/http",
+    deps: {},
+}

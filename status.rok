@@ -1,0 +1,112 @@
+// Status codes (RFC 9110 section 15).
+
+use pkg::error::{HttpError, parse_err};
+
+/// A three-digit status code, `100..=999`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StatusCode {
+    code: u16;
+}
+
+impl StatusCode {
+    pub const CONTINUE: StatusCode = StatusCode { code: 100u16 };
+    pub const SWITCHING_PROTOCOLS: StatusCode = StatusCode { code: 101u16 };
+    pub const OK: StatusCode = StatusCode { code: 200u16 };
+    pub const CREATED: StatusCode = StatusCode { code: 201u16 };
+    pub const ACCEPTED: StatusCode = StatusCode { code: 202u16 };
+    pub const NO_CONTENT: StatusCode = StatusCode { code: 204u16 };
+    pub const PARTIAL_CONTENT: StatusCode = StatusCode { code: 206u16 };
+    pub const MOVED_PERMANENTLY: StatusCode = StatusCode { code: 301u16 };
+    pub const FOUND: StatusCode = StatusCode { code: 302u16 };
+    pub const SEE_OTHER: StatusCode = StatusCode { code: 303u16 };
+    pub const NOT_MODIFIED: StatusCode = StatusCode { code: 304u16 };
+    pub const TEMPORARY_REDIRECT: StatusCode = StatusCode { code: 307u16 };
+    pub const PERMANENT_REDIRECT: StatusCode = StatusCode { code: 308u16 };
+    pub const BAD_REQUEST: StatusCode = StatusCode { code: 400u16 };
+    pub const UNAUTHORIZED: StatusCode = StatusCode { code: 401u16 };
+    pub const FORBIDDEN: StatusCode = StatusCode { code: 403u16 };
+    pub const NOT_FOUND: StatusCode = StatusCode { code: 404u16 };
+    pub const METHOD_NOT_ALLOWED: StatusCode = StatusCode { code: 405u16 };
+    pub const REQUEST_TIMEOUT: StatusCode = StatusCode { code: 408u16 };
+    pub const LENGTH_REQUIRED: StatusCode = StatusCode { code: 411u16 };
+    pub const CONTENT_TOO_LARGE: StatusCode = StatusCode { code: 413u16 };
+    pub const URI_TOO_LONG: StatusCode = StatusCode { code: 414u16 };
+    pub const EXPECTATION_FAILED: StatusCode = StatusCode { code: 417u16 };
+    pub const HEADER_FIELDS_TOO_LARGE: StatusCode = StatusCode { code: 431u16 };
+    pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode { code: 500u16 };
+    pub const NOT_IMPLEMENTED: StatusCode = StatusCode { code: 501u16 };
+    pub const BAD_GATEWAY: StatusCode = StatusCode { code: 502u16 };
+    pub const SERVICE_UNAVAILABLE: StatusCode = StatusCode { code: 503u16 };
+    pub const HTTP_VERSION_NOT_SUPPORTED: StatusCode = StatusCode { code: 505u16 };
+
+    pub fn new(code: u16) throws (HttpError) -> StatusCode {
+        if code < 100u16 || code > 999u16 { throw parse_err(f"invalid status code {code}"); }
+        StatusCode { code: code }
+    }
+
+    pub fn as_u16(self) -> u16 { self.code }
+
+    pub fn is_informational(self) -> bool { self.code < 200u16 }
+    pub fn is_success(self) -> bool { self.code >= 200u16 && self.code < 300u16 }
+    pub fn is_redirection(self) -> bool { self.code >= 300u16 && self.code < 400u16 }
+    pub fn is_client_error(self) -> bool { self.code >= 400u16 && self.code < 500u16 }
+    pub fn is_server_error(self) -> bool { self.code >= 500u16 && self.code < 600u16 }
+
+    /// The RFC 9110 reason phrase, or `""` for an unregistered code.
+    pub fn reason(self) -> str {
+        match self.code {
+            100u16 => "Continue",
+            101u16 => "Switching Protocols",
+            200u16 => "OK",
+            201u16 => "Created",
+            202u16 => "Accepted",
+            203u16 => "Non-Authoritative Information",
+            204u16 => "No Content",
+            205u16 => "Reset Content",
+            206u16 => "Partial Content",
+            300u16 => "Multiple Choices",
+            301u16 => "Moved Permanently",
+            302u16 => "Found",
+            303u16 => "See Other",
+            304u16 => "Not Modified",
+            307u16 => "Temporary Redirect",
+            308u16 => "Permanent Redirect",
+            400u16 => "Bad Request",
+            401u16 => "Unauthorized",
+            403u16 => "Forbidden",
+            404u16 => "Not Found",
+            405u16 => "Method Not Allowed",
+            406u16 => "Not Acceptable",
+            408u16 => "Request Timeout",
+            409u16 => "Conflict",
+            410u16 => "Gone",
+            411u16 => "Length Required",
+            412u16 => "Precondition Failed",
+            413u16 => "Content Too Large",
+            414u16 => "URI Too Long",
+            415u16 => "Unsupported Media Type",
+            416u16 => "Range Not Satisfiable",
+            417u16 => "Expectation Failed",
+            421u16 => "Misdirected Request",
+            422u16 => "Unprocessable Content",
+            426u16 => "Upgrade Required",
+            429u16 => "Too Many Requests",
+            431u16 => "Request Header Fields Too Large",
+            500u16 => "Internal Server Error",
+            501u16 => "Not Implemented",
+            502u16 => "Bad Gateway",
+            503u16 => "Service Unavailable",
+            504u16 => "Gateway Timeout",
+            505u16 => "HTTP Version Not Supported",
+            _ => "",
+        }
+    }
+}
+
+impl Display for StatusCode {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"{self.code}") }
+}
+
+impl Debug for StatusCode {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"{self.code}") }
+}

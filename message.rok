@@ -1,0 +1,125 @@
+// Requests and responses.
+
+use pkg::body::Body;
+use pkg::error::HttpError;
+use pkg::headers::HeaderMap;
+use pkg::method::Method;
+use pkg::status::StatusCode;
+use pkg::uri::{Uri, form_encode};
+
+/// The protocol a message travelled over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Version {
+    Http10,
+    Http11,
+    Http2,
+}
+
+impl Display for Version {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(match self {
+            Version::Http10 => "HTTP/1.0",
+            Version::Http11 => "HTTP/1.1",
+            Version::Http2 => "HTTP/2",
+        })
+    }
+}
+
+/// A request. A client sends an absolute `uri`; a server receives the
+/// request target (`/path?query`) with the host filled in from `Host`
+/// / `:authority` and the scheme from the connection.
+pub struct Request {
+    pub method: Method;
+    pub uri: Uri;
+    pub version: Version = Version::Http11;
+    pub headers: HeaderMap;
+    pub body: Body;
+}
+
+impl Request {
+    pub fn new(method: Method, uri: Uri) -> Request {
+        Request { method: method, uri: uri, headers: HeaderMap::new(), body: Body::empty() }
+    }
+
+    /// A request for `url`, which must be absolute.
+    pub fn to(method: Method, url: str) throws (HttpError) -> Request {
+        let u = try Uri::parse(url);
+        if !u.is_absolute() || u.host is none { throw pkg::error::parse_err(f"not an absolute URL: {url:?}"); }
+        Request::new(method, u)
+    }
+
+    pub fn get(url: str) throws (HttpError) -> Request { try Request::to(Method::GET, url) }
+    pub fn head(url: str) throws (HttpError) -> Request { try Request::to(Method::HEAD, url) }
+    pub fn post(url: str) throws (HttpError) -> Request { try Request::to(Method::POST, url) }
+    pub fn put(url: str) throws (HttpError) -> Request { try Request::to(Method::PUT, url) }
+    pub fn delete(url: str) throws (HttpError) -> Request { try Request::to(Method::DELETE, url) }
+
+    /// Append a header field.
+    pub fn header(self, name: str, value: str) -> Request {
+        self.headers.append(name, value);
+        self
+    }
+
+    pub fn with_body(self, body: Body) -> Request {
+        self.body = body;
+        self
+    }
+
+    /// A text body with `Content-Type: text/plain; charset=utf-8` unless
+    /// one is set.
+    pub fn text(self, s: str) -> Request {
+        if !self.headers.contains("content-type") { self.headers.append("content-type", "text/plain; charset=utf-8"); }
+        self.with_body(Body::from_str(s))
+    }
+
+    /// A form body (`application/x-www-form-urlencoded`).
+    pub fn form(self, pairs: List<(str, str)>) -> Request {
+        self.headers.insert("content-type", "application/x-www-form-urlencoded");
+        self.with_body(Body::from_str(form_encode(pairs)))
+    }
+}
+
+/// A response.
+pub struct Response {
+    pub status: StatusCode;
+    pub version: Version = Version::Http11;
+    pub headers: HeaderMap;
+    pub body: Body;
+}
+
+impl Response {
+    pub fn new(status: StatusCode) -> Response {
+        Response { status: status, headers: HeaderMap::new(), body: Body::empty() }
+    }
+
+    /// 200 with a text body.
+    pub fn text(s: str) -> Response {
+        let r = Response::new(StatusCode::OK);
+        r.headers.append("content-type", "text/plain; charset=utf-8");
+        r.body = Body::from_str(s);
+        r
+    }
+
+    /// 200 with a byte body.
+    pub fn bytes(data: List<u8>) -> Response {
+        let r = Response::new(StatusCode::OK);
+        r.body = Body::from_bytes(data);
+        r
+    }
+
+    /// Append a header field.
+    pub fn header(self, name: str, value: str) -> Response {
+        self.headers.append(name, value);
+        self
+    }
+
+    pub fn with_status(self, status: StatusCode) -> Response {
+        self.status = status;
+        self
+    }
+
+    pub fn with_body(self, body: Body) -> Response {
+        self.body = body;
+        self
+    }
+}

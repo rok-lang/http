@@ -1,0 +1,136 @@
+// Header fields (RFC 9110 section 5): a case-insensitive multimap that
+// keeps insertion order.
+
+use pkg::error::{HttpError, parse_err};
+
+/// Header fields in order. Names are stored lowercase (lookups ignore
+/// case); a name may repeat. Like `List`, a `HeaderMap` is a handle:
+/// copies share the fields (`clone` for an independent map).
+pub struct HeaderMap {
+    names: List<str>;
+    values: List<str>;
+}
+
+impl HeaderMap {
+    pub fn new() -> HeaderMap { HeaderMap { names: List::new(), values: List::new() } }
+
+    /// Number of fields (each repeat counts).
+    pub fn len(self) -> usize { self.names.len() }
+
+    pub fn is_empty(self) -> bool { self.names.is_empty() }
+
+    /// The first value of `name`.
+    pub fn get(self, name: str) -> str | none {
+        let n = name.to_lowercase();
+        for i in 0..self.names.len() {
+            if self.names[i] == n { return self.values[i]; }
+        }
+        none
+    }
+
+    /// Every value of `name`, in order.
+    pub fn get_all(self, name: str) -> List<str> {
+        let n = name.to_lowercase();
+        let out: List<str> = List::new();
+        for i in 0..self.names.len() {
+            if self.names[i] == n { out.push(self.values[i]); }
+        }
+        out
+    }
+
+    pub fn contains(self, name: str) -> bool { self.get(name) is str }
+
+    /// Add a field after the existing ones.
+    pub fn append(self, name: str, value: str) {
+        self.names.push(name.to_lowercase());
+        self.values.push(value);
+    }
+
+    /// Replace every value of `name` with `value`.
+    pub fn insert(self, name: str, value: str) {
+        self.remove(name);
+        self.append(name, value);
+    }
+
+    /// Remove every value of `name`; whether there was one.
+    pub fn remove(self, name: str) -> bool {
+        let n = name.to_lowercase();
+        let found = false;
+        let i = 0usize;
+        while i < self.names.len() {
+            if self.names[i] == n {
+                self.names.remove(i);
+                self.values.remove(i);
+                found = true;
+            } else {
+                i += 1;
+            }
+        }
+        found
+    }
+
+    /// `(name, value)` pairs in order, names lowercase.
+    pub fn entries(self) -> List<(str, str)> {
+        let out: List<(str, str)> = List::with_capacity(self.names.len());
+        for i in 0..self.names.len() { out.push((self.names[i], self.values[i])); }
+        out
+    }
+
+    /// Whether a comma-separated list header `name` contains `token`
+    /// (ASCII case-insensitive): `has_token("connection", "close")`.
+    pub fn has_token(self, name: str, token: str) -> bool {
+        let t = token.to_lowercase();
+        for v in self.get_all(name) {
+            for part in v.split(",") {
+                if part.trim().to_lowercase() == t { return true; }
+            }
+        }
+        false
+    }
+
+    /// Throws if a name is not a token or a value has CR, LF, NUL or
+    /// another control character (except tab): what goes on the wire
+    /// must not be able to inject fields.
+    pub fn validate(self) throws (HttpError) {
+        for i in 0..self.names.len() {
+            if !is_token(self.names[i]) { throw parse_err(f"invalid header name {self.names[i]:?}"); }
+            if !is_field_value(self.values[i]) {
+                throw parse_err(f"invalid value for header {self.names[i]}");
+            }
+        }
+    }
+}
+
+impl Clone for HeaderMap {
+    fn clone(self) -> HeaderMap { HeaderMap { names: self.names.clone(), values: self.values.clone() } }
+}
+
+impl Debug for HeaderMap {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"{self.entries():?}") }
+}
+
+/// A `tchar` (RFC 9110 5.6.2).
+pub(pkg) fn is_tchar(b: u8) -> bool {
+    if b >= 0x61u8 && b <= 0x7Au8 || b >= 0x41u8 && b <= 0x5Au8 || b >= 0x30u8 && b <= 0x39u8 { return true; }
+    b == 0x21u8 || b == 0x23u8 || b == 0x24u8 || b == 0x25u8 || b == 0x26u8 || b == 0x27u8 || b == 0x2Au8
+        || b == 0x2Bu8 || b == 0x2Du8 || b == 0x2Eu8 || b == 0x5Eu8 || b == 0x5Fu8 || b == 0x60u8
+        || b == 0x7Cu8 || b == 0x7Eu8
+}
+
+/// A non-empty run of `tchar`s.
+pub fn is_token(s: str) -> bool {
+    if s.is_empty() { return false; }
+    for b in s.bytes() {
+        if !is_tchar(b) { return false; }
+    }
+    true
+}
+
+/// A field value: visible ASCII, space, tab and obs-text, no leading or
+/// trailing whitespace (RFC 9110 5.5).
+pub fn is_field_value(s: str) -> bool {
+    for b in s.bytes() {
+        if b < 0x20u8 && b != 0x09u8 || b == 0x7Fu8 { return false; }
+    }
+    s.len() == 0 || s.trim().len() == s.len()
+}

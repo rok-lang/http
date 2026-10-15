@@ -1,0 +1,121 @@
+// Message bodies: a stream of byte chunks over a channel.
+
+use pkg::error::{HttpError, ErrorKind};
+
+/// A piece of a body, or the error that ended it.
+pub(pkg) type Chunk = List<u8> | HttpError;
+
+/// A message body: a stream of byte chunks read once with `chunk`,
+/// `bytes` or `text`. A body built from bytes also keeps them, so a
+/// request with one can be resent (redirects). Copies share the stream.
+pub struct Body {
+    rx: Receiver<Chunk> | none;
+    /// Demand and consumption reports to the producer: `(tag, 0)` before
+    /// each read, `(tag, n)` after a chunk of `n` bytes.
+    credit: Sender<(u32, usize)> | none = none;
+    tag: u32 = 0u32;
+    /// The length, when known (`Content-Length`).
+    len: u64 | none = none;
+    full: List<u8> | none = none;
+}
+
+impl Body {
+    pub fn empty() -> Body { Body { rx: none, len: 0u64, full: List::<u8>::new() } }
+
+    pub fn from_bytes(data: List<u8>) -> Body {
+        if data.is_empty() { return Body::empty(); }
+        let (tx, rx) = channel::<Chunk>();
+        try! tx.send(data);
+        tx.close();
+        Body { rx: rx, len: data.len() as u64, full: data }
+    }
+
+    pub fn from_str(s: str) -> Body { Body::from_bytes(s.as_bytes().to_list()) }
+
+    /// A body fed by the returned writer, with room for `cap` chunks in
+    /// flight. `len`: the total, if known in advance.
+    pub fn channel(cap: usize = 4, len: u64 | none = none) -> (BodyWriter, Body) {
+        let (tx, rx) = channel_bounded::<Chunk>(cap);
+        (BodyWriter { tx: tx }, Body { rx: rx, len: len })
+    }
+
+    /// A body fed by a producer that is told when it is read.
+    pub(pkg) fn pulled(rx: Receiver<Chunk>, credit: Sender<(u32, usize)>, tag: u32, len: u64 | none) -> Body {
+        Body { rx: rx, credit: credit, tag: tag, len: len }
+    }
+
+    /// The length, if known.
+    pub fn len(self) -> u64 | none { self.len }
+
+    /// Whether the body is known to be empty.
+    pub fn is_empty(self) -> bool { self.rx is none || self.len == 0u64 }
+
+    /// The bytes it was built from, if it was.
+    pub fn replayable(self) -> List<u8> | none { self.full }
+
+    /// The next chunk, or `none` at the end.
+    pub async fn chunk(self) throws (HttpError) -> List<u8> | none {
+        let rx = match self.rx {
+            r: Receiver<Chunk> => r,
+            none => return none,
+        };
+        if let c: Sender<(u32, usize)> = self.credit { try? c.send((self.tag, 0usize)); }
+        match await rx.recv_async() {
+            b: List<u8> => {
+                if let c: Sender<(u32, usize)> = self.credit {
+                    if b.len() > 0 { try? c.send((self.tag, b.len())); }
+                }
+                b
+            },
+            e: HttpError => throw e,
+            none => none,
+        }
+    }
+
+    /// The whole body; throws `TooLarge` past `limit` bytes.
+    pub async fn bytes(self, limit: usize = 1usize << 30usize) throws (HttpError) -> List<u8> {
+        let out: List<u8> = List::new();
+        loop {
+            let c = try await self.chunk();
+            match c {
+                b: List<u8> => {
+                    if out.len() + b.len() > limit { throw HttpError::new(ErrorKind::TooLarge, "body too large"); }
+                    if out.is_empty() { out = b; } else { out.extend(b); }
+                },
+                none => break,
+            }
+        }
+        out
+    }
+
+    /// The whole body as UTF-8 text.
+    pub async fn text(self, limit: usize = 1usize << 30usize) throws (HttpError) -> str {
+        let b = try await self.bytes(limit);
+        try str::from_utf8(b) catch _ { throw HttpError::new(ErrorKind::Parse, "body is not UTF-8"); }
+    }
+}
+
+/// The feeding end of `Body::channel`.
+pub struct BodyWriter {
+    tx: Sender<Chunk>;
+}
+
+impl BodyWriter {
+    /// Send a chunk; waits while `cap` chunks are unread. Throws
+    /// `Closed` when the reader is gone.
+    pub async fn send(self, data: List<u8>) throws (HttpError) {
+        if data.is_empty() { return; }
+        try await self.tx.send_async(data) catch _ { throw HttpError::new(ErrorKind::Closed, "body reader gone"); };
+    }
+
+    pub async fn send_str(self, s: str) throws (HttpError) { try await self.send(s.as_bytes().to_list()); }
+
+    /// End the body.
+    pub fn finish(self) { self.tx.close(); }
+
+    /// End the body with an error the reader gets.
+    pub async fn fail(self, e: HttpError) {
+        try? await self.tx.send_async(e);
+        self.tx.close();
+    }
+}

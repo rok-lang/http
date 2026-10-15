@@ -1,0 +1,47 @@
+// Request methods (RFC 9110 section 9).
+
+use pkg::error::{HttpError, parse_err};
+use pkg::headers::is_token;
+
+/// A request method. Methods are case-sensitive tokens; the standard
+/// ones are constants (`Method::GET`), others come from `parse`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Method {
+    name: str;
+}
+
+impl Method {
+    pub const GET: Method = Method { name: "GET" };
+    pub const HEAD: Method = Method { name: "HEAD" };
+    pub const POST: Method = Method { name: "POST" };
+    pub const PUT: Method = Method { name: "PUT" };
+    pub const DELETE: Method = Method { name: "DELETE" };
+    pub const CONNECT: Method = Method { name: "CONNECT" };
+    pub const OPTIONS: Method = Method { name: "OPTIONS" };
+    pub const TRACE: Method = Method { name: "TRACE" };
+    pub const PATCH: Method = Method { name: "PATCH" };
+
+    /// Any token is a method; anything else is an error.
+    pub fn parse(s: str) throws (HttpError) -> Method {
+        if !is_token(s) { throw parse_err(f"invalid method {s:?}"); }
+        Method { name: s }
+    }
+
+    pub fn as_str(self) -> str { self.name }
+
+    /// GET, HEAD, OPTIONS, TRACE (9.2.1).
+    pub fn is_safe(self) -> bool {
+        self.name == "GET" || self.name == "HEAD" || self.name == "OPTIONS" || self.name == "TRACE"
+    }
+
+    /// The safe methods plus PUT and DELETE (9.2.2).
+    pub fn is_idempotent(self) -> bool { self.is_safe() || self.name == "PUT" || self.name == "DELETE" }
+}
+
+impl Display for Method {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.name) }
+}
+
+impl Debug for Method {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.name) }
+}

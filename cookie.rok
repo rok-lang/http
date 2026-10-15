@@ -1,0 +1,130 @@
+// Cookies (RFC 6265): the `Cookie` request header and `Set-Cookie`.
+
+use pkg::error::{HttpError, parse_err};
+use pkg::headers::is_token;
+
+/// `name=value` pairs of a `Cookie` header, in order.
+pub fn parse_cookie_header(s: str) -> List<(str, str)> {
+    let out: List<(str, str)> = List::new();
+    for piece in s.split(";") {
+        let p = piece.trim();
+        if let (k, v): (str, str) = p.split_once("=") {
+            let name = k.trim();
+            if !name.is_empty() { out.push((name, unquote(v.trim()))); }
+        }
+    }
+    out
+}
+
+/// A `Cookie` header value from pairs; throws on an invalid name or
+/// value.
+pub fn cookie_header(pairs: List<(str, str)>) throws (HttpError) -> str {
+    let parts: List<str> = List::new();
+    for (k, v) in pairs {
+        try check_pair(k, v);
+        parts.push(f"{k}={v}");
+    }
+    parts.join("; ")
+}
+
+fn unquote(v: str) -> str {
+    if v.len() >= 2 && v.starts_with("\"") && v.ends_with("\"") { v[1:v.len() - 1] } else { v }
+}
+
+/// A `cookie-octet` (4.1.1): visible ASCII except `"` `,` `;` `\`.
+fn is_cookie_octet(b: u8) -> bool {
+    b == 0x21u8 || b >= 0x23u8 && b <= 0x2Bu8 || b >= 0x2Du8 && b <= 0x3Au8 || b >= 0x3Cu8 && b <= 0x5Bu8
+        || b >= 0x5Du8 && b <= 0x7Eu8
+}
+
+fn check_pair(name: str, value: str) throws (HttpError) {
+    if !is_token(name) { throw parse_err(f"invalid cookie name {name:?}"); }
+    for b in unquote(value).bytes() {
+        if !is_cookie_octet(b) { throw parse_err(f"invalid value for cookie {name}"); }
+    }
+}
+
+/// A `Set-Cookie` header. `expires` is kept as written (an HTTP date).
+#[derive(Clone, PartialEq, Debug)]
+pub struct SetCookie {
+    pub name: str;
+    pub value: str;
+    pub expires: str | none = none;
+    pub max_age: i64 | none = none;
+    pub domain: str | none = none;
+    pub path: str | none = none;
+    pub secure: bool = false;
+    pub http_only: bool = false;
+    /// `Strict`, `Lax` or `None`.
+    pub same_site: str | none = none;
+}
+
+impl SetCookie {
+    /// Parse as a user agent does (RFC 6265 5.2): `none` when there is
+    /// no `=` or the name is empty; unknown or malformed attributes are
+    /// ignored.
+    pub fn parse(s: str) -> SetCookie | none {
+        let parts = s.split(";");
+        let first = parts.next() ?? "";
+        let (k, v) = first.split_once("=")?;
+        let c = SetCookie { name: k.trim(), value: v.trim() };
+        if c.name.is_empty() { return none; }
+        for attr in parts {
+            let (an, av) = attr.split_once("=") ?? (attr, "");
+            let n = an.trim().to_lowercase();
+            let val = av.trim();
+            if n == "expires" {
+                c.expires = val;
+            } else if n == "max-age" {
+                if let x: i64 = parse_max_age(val) { c.max_age = x; }
+            } else if n == "domain" {
+                if !val.is_empty() { c.domain = (val.strip_prefix(".") ?? val).to_lowercase(); }
+            } else if n == "path" {
+                c.path = if val.starts_with("/") { val } else { none };
+            } else if n == "secure" {
+                c.secure = true;
+            } else if n == "httponly" {
+                c.http_only = true;
+            } else if n == "samesite" {
+                let l = val.to_lowercase();
+                c.same_site = if l == "strict" { "Strict" } else if l == "lax" { "Lax" } else if l == "none" { "None" } else { none };
+            }
+        }
+        c
+    }
+
+    /// The header value (RFC 6265 4.1); throws if the name, value or an
+    /// attribute could break the header.
+    pub fn to_header(self) throws (HttpError) -> str {
+        try check_pair(self.name, self.value);
+        let out = StrBuf::new();
+        out.push_str(f"{self.name}={self.value}");
+        if let e: str = self.expires { out.push_str(try attr("Expires", e)); }
+        if let m: i64 = self.max_age { out.push_str(f"; Max-Age={m}"); }
+        if let d: str = self.domain { out.push_str(try attr("Domain", d)); }
+        if let p: str = self.path { out.push_str(try attr("Path", p)); }
+        if self.secure { out.push_str("; Secure"); }
+        if self.http_only { out.push_str("; HttpOnly"); }
+        if let ss: str = self.same_site { out.push_str(try attr("SameSite", ss)); }
+        out.to_str()
+    }
+}
+
+fn attr(name: str, v: str) throws (HttpError) -> str {
+    for b in v.bytes() {
+        if b < 0x20u8 || b == 0x7Fu8 || b == 0x3Bu8 { throw parse_err(f"invalid cookie {name} {v:?}"); }
+    }
+    f"; {name}={v}"
+}
+
+fn parse_max_age(v: str) -> i64 | none {
+    let neg = v.starts_with("-");
+    let d = if neg { v[1:] } else { v };
+    if d.is_empty() || d.len() > 18 { return none; }
+    let n = 0i64;
+    for b in d.bytes() {
+        if b < 0x30u8 || b > 0x39u8 { return none; }
+        n = n * 10 + (b - 0x30u8) as i64;
+    }
+    if neg { -n } else { n }
+}
