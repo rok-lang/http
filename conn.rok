@@ -1,9 +1,10 @@
-// A buffered TCP connection with deadlines, shared by HTTP/1.1 and
-// HTTP/2.
+// A buffered TCP or TLS connection with deadlines, shared by HTTP/1.1
+// and HTTP/2.
 
 use rok::std::net::{TcpStream, Shutdown};
 use rok::std::io::{IoError, IoErrorKind, byte_buf};
 use pkg::error::{HttpError, ErrorKind};
+use pkg::tls::{Link, Op, In, Side};
 
 /// Read granularity.
 const READ_CHUNK: usize = 16384;
@@ -19,6 +20,10 @@ struct Buf {
 pub(pkg) struct Io {
     pub s: TcpStream;
     st: List<Buf>;
+    /// Set when the connection is TLS.
+    t: Link | none = none;
+    /// The protocol ALPN chose (`""`: none, or plaintext).
+    pub alpn: str = "";
 }
 
 pub(pkg) fn io_err(e: IoError) -> HttpError {
@@ -62,8 +67,64 @@ pub(pkg) async fn connect(host: str, port: u16, deadline: Instant | none) throws
     Io::new(s)
 }
 
+/// The socket side of an `Io`, without its read buffer (shareable
+/// across tasks).
+pub(pkg) struct Wire {
+    s: TcpStream;
+    t: Link | none;
+    alpn: str;
+}
+
+/// TLS over `io` (fresh, nothing read yet), handshake done before
+/// `deadline`.
+pub(pkg) async fn start_tls(io: Io, side: Side, deadline: Instant | none) throws (HttpError) -> Io {
+    let l = try await pkg::tls::start(io.s, side) catch e: IoError {
+        io.close();
+        throw io_err(e);
+    };
+    let t = Io { s: io.s, st: io.st, t: l };
+    let first = await within(ready_res(l), deadline, "TLS handshake");
+    match first {
+        Result::Err(e) => {
+            t.close();
+            throw io_err(e);
+        },
+        Result::Ok(In::Ready(a)) => {
+            t.alpn = try str::from_utf8(a) catch _ { "" };
+            t
+        },
+        Result::Ok(In::Failed(m)) => {
+            t.close();
+            throw HttpError::new(ErrorKind::Tls, m);
+        },
+        _ => {
+            t.close();
+            throw HttpError::new(ErrorKind::Closed, "connection closed during the TLS handshake");
+        },
+    }
+}
+
+async fn recv_in(l: Link, deadline: Instant | none) throws (HttpError) -> In {
+    let r = await within(next_res(l), deadline, "read");
+    match r {
+        Result::Ok(x) => x,
+        Result::Err(e) => throw io_err(e),
+    }
+}
+
+async fn ready_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.input.recv_async() ?? In::End) }
+
+async fn next_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.next()) }
+
+async fn ack_res(rx: Receiver<str>) -> Result<str, IoError> { Result::Ok(await rx.recv_async() ?? "connection closed") }
+
 impl Io {
     pub fn new(s: TcpStream) -> Io { Io { s: s, st: [Buf { data: List::new(), at: 0usize }] } }
+
+    pub fn wire(self) -> Wire { Wire { s: self.s, t: self.t, alpn: self.alpn } }
+
+    /// An `Io` on `w` with an empty read buffer.
+    pub fn of(w: Wire) -> Io { Io { s: w.s, st: [Buf { data: List::new(), at: 0usize }], t: w.t, alpn: w.alpn } }
 
     /// Number of unread bytes.
     pub fn buffered(self) -> usize { self.st[0].data.len() - self.st[0].at }
@@ -88,8 +149,20 @@ impl Io {
     /// Read more from the socket; `false` at end of stream.
     pub async fn fill(self, deadline: Instant | none) throws (HttpError) -> bool {
         let scratch = byte_buf(READ_CHUNK);
-        let n = try await read_some(self.s, scratch, deadline);
-        if n == 0 { return false; }
+        let n = 0usize;
+        if let l: Link = self.t {
+            match try await recv_in(l, deadline) {
+                In::Data(d) => {
+                    scratch = d;
+                    n = d.len();
+                },
+                In::Failed(m) => throw HttpError::new(ErrorKind::Io, m),
+                _ => return false,
+            }
+        } else {
+            n = try await read_some(self.s, scratch, deadline);
+            if n == 0 { return false; }
+        }
         let b = self.st[0];
         if b.at == b.data.len() {
             self.st[0] = Buf { data: scratch[0:n].to_list(), at: 0usize };
@@ -111,11 +184,34 @@ impl Io {
     }
 
     pub async fn write(self, data: Slice<u8>, deadline: Instant | none) throws (HttpError) {
+        if let l: Link = self.t {
+            let (atx, arx) = channel::<str>();
+            try l.ops.send(Op::Write(data.to_list(), atx)) catch _ { throw HttpError::new(ErrorKind::Io, "connection closed"); };
+            match await within(ack_res(arx), deadline, "write") {
+                Result::Ok(m) => if !m.is_empty() { throw HttpError::new(ErrorKind::Io, m); },
+                Result::Err(e) => throw io_err(e),
+            }
+            return;
+        }
         let r = await within(write_res(self.s, data), deadline, "write");
         if let Result::Err(e) = r { throw io_err(e); }
     }
 
+    /// Stop both directions: pending reads end. TLS sends close_notify.
+    pub fn shutdown(self) {
+        if let l: Link = self.t {
+            try? l.ops.send(Op::Close);
+        } else {
+            try? self.s.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// End the connection; TLS sends close_notify first.
     pub fn close(self) {
+        if let l: Link = self.t {
+            try? l.ops.send(Op::Close);
+            return;
+        }
         try? self.s.shutdown(Shutdown::Both);
         self.s.close();
     }

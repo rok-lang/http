@@ -1,11 +1,12 @@
 // Tests: the message model, HTTP/1.1 parsing and smuggling cases,
 // HPACK vectors (RFC 7541 Appendix C), HTTP/2 framing, loopback client
-// and server for each version.
+// and server for each version, over TLS too.
 
 mod model;
 mod h1;
 mod hpack;
 mod h2;
+mod tls;
 
 pub fn expect(ok: bool, what: str) {
     if !ok { panic(f"check failed: {what}"); }

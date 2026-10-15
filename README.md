@@ -1,11 +1,11 @@
 # http
 
-HTTP/1.1 ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) / [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)) and HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113), HPACK [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541)) for rok: the message model, a pooling client and an async server, built on `rok::std::net` with no other dependencies.
+HTTP/1.1 ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) / [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)) and HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113), HPACK [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541)) for rok: the message model, a pooling client and an async server, over plaintext or TLS 1.3, built on `rok::std::net` (and `rok::std::net::tls`) with no other dependencies.
 
 - **Model**: `Method`, `StatusCode`, `HeaderMap` (case-insensitive multimap in insertion order), `Uri` (RFC 3986 parsing, normalization, reference resolution, percent-encoding), `application/x-www-form-urlencoded`, cookies (RFC 6265 `Cookie` / `Set-Cookie`), `Request` / `Response` with streaming `Body`s.
 - **HTTP/1.1**: keep-alive, pipelining, chunked bodies (extensions and trailers accepted), `Expect: 100-continue`, size limits and timeouts, graceful shutdown. Parsing is strict where leniency enables request smuggling or response splitting (see below).
 - **HTTP/2**: client and server with prior knowledge over plaintext (h2c), HPACK with Huffman coding, stream and connection flow control, RFC 9218 priorities (`priority` header and `PRIORITY_UPDATE`) for response scheduling, SETTINGS / PING / GOAWAY / RST_STREAM handling, graceful shutdown with GOAWAY. Server push is not implemented (the client disables it).
-- **TLS**: not yet. `https` URLs fail with `ErrorKind::Unsupported` until `rok::std::net::tls` lands; then ALPN (`h2`, `http/1.1`) selects the version and the HTTP/2 engine runs unchanged over it.
+- **TLS**: `https` URLs (SNI, certificates checked against the OS trust store or your roots) and a TLS server, both on std's TLS 1.3. ALPN offers `h2` and `http/1.1`; HTTP/2 is used when the server picks it. Servers need an Ed25519 certificate for now (std's limit). See [TLS internals](#tls-internals) for the costs.
 
 ## Usage
 
@@ -37,6 +37,12 @@ while let chunk: List<u8> = try await resp.body.chunk() {
 
 // HTTP/2 by prior knowledge (h2c) for http:// URLs.
 let h2 = http::Client::new(http::ClientConfig { version: http::Version::Http2 });
+
+// https with your own trust anchors (default: the OS trust store).
+let tc = tls::ClientConfig::new();
+tc.root_certs = try tls::Certificate::from_pem(try fs::read_to_str("ca.pem"));
+let sc = http::Client::with_tls(tc);
+let r = try await sc.get("https://localhost:8443/");   // r.version: Http2 or Http11, as ALPN chose
 ```
 
 ### Server
@@ -67,6 +73,14 @@ async fn handle(req: Request) -> Response {
 try await http::serve("127.0.0.1:8080", handle);
 ```
 
+Over TLS (`use rok::std::net::tls;`); ALPN selects HTTP/2 or HTTP/1.1 per connection:
+
+```rok
+let chain = try tls::Certificate::from_pem(try fs::read_to_str("cert.pem"));
+let key = try tls::PrivateKey::from_pem(try fs::read_to_str("key.pem"));
+try await http::serve_tls("0.0.0.0:8443", tls::ServerConfig::new(chain, key), handle);
+```
+
 With settings and graceful shutdown:
 
 ```rok
@@ -81,10 +95,10 @@ await s.shutdown(Duration::sec(10));   // stop accepting, finish in-flight reque
 | Item | Description |
 |------|-------------|
 | `get(url) -> Response` | GET with a default client (async, throws `HttpError`) |
-| `Client::new(cfg?)`, `send(req)`, `send_once(req)`, `get(url)` | Pooling client; `send` follows redirects (301/302/303 turn POST into GET, 307/308 resend a replayable body; credentials are dropped across origins) |
+| `Client::new(cfg?)`, `Client::with_tls(tls_cfg, cfg?)`, `send(req)`, `send_once(req)`, `get(url)` | Pooling client; `send` follows redirects (301/302/303 turn POST into GET, 307/308 resend a replayable body; credentials are dropped across origins) |
 | `ClientConfig` | `timeout`, `connect_timeout`, `read_timeout`, `max_redirects`, `version`, `max_idle_per_host`, `idle_timeout`, `user_agent`, `limits`, `h2` |
-| `serve(addr, handler)` | Bind and serve until the process ends |
-| `Server::bind(addr, handler, cfg?)`, `run()`, `shutdown(grace)`, `local_addr()` | A server you control |
+| `serve(addr, handler)`, `serve_tls(addr, tls_cfg, handler)` | Bind and serve until the process ends |
+| `Server::bind(addr, handler, cfg?)`, `Server::bind_tls(addr, handler, tls_cfg, cfg?)`, `run()`, `shutdown(grace)`, `local_addr()` | A server you control |
 | `ServerConfig` | `limits`, `header_timeout`, `idle_timeout`, `io_timeout`, `max_body`, `http2`, `h2` |
 | `h2::Config` | `max_concurrent_streams`, `initial_window_size`, `connection_window_size`, `max_frame_size`, `max_header_list_size`, `huffman`, `idle_timeout`, `write_timeout` |
 | `Request` | `method`, `uri`, `version`, `headers`, `body`; `Request::get/head/post/put/delete(url)`, `.header(k, v)`, `.text(s)`, `.form(pairs)`, `.with_body(b)` |
@@ -94,7 +108,7 @@ await s.shutdown(Duration::sec(10));   // stop accepting, finish in-flight reque
 | `Uri` | `parse`, `normalize`, `resolve`, `join`, `authority`, `path_and_query`, `query_pairs`, `port_or_default` |
 | `percent_encode/decode`, `form_encode/decode` | Escaping helpers |
 | `parse_cookie_header`, `cookie_header`, `SetCookie::parse/to_header` | Cookies |
-| `HttpError { kind, message, code }` | `ErrorKind`: `Parse`, `Protocol`, `TooLarge`, `Timeout`, `Closed`, `Reset`, `Redirect`, `Unsupported`, `Io` |
+| `HttpError { kind, message, code }` | `ErrorKind`: `Parse`, `Protocol`, `TooLarge`, `Timeout`, `Closed`, `Reset`, `Redirect`, `Unsupported`, `Tls`, `Io` |
 
 ## HTTP/1.1 strictness
 
@@ -109,9 +123,15 @@ Requests that could be read two ways are refused (400, connection closed) instea
 
 Outgoing header values are checked (`HeaderMap::validate`) so CR / LF cannot inject fields.
 
+## TLS internals
+
+`rok::std::net::tls` connections are blocking and must not be read and written from two threads at once, while HTTP/2 does both. So each TLS connection gets its own thread that owns the TLS state and runs one read or write at a time, talking to the network through a loopback socket pair whose other end async tasks copy to and from the real socket. A read is only started once a whole record has arrived, so reads do not wait on the network and writes do not wait behind them.
+
+Costs and limits: one thread and one loopback socket pair per TLS connection, and an extra copy of every byte. If the only records pending carry no application data (a lone KeyUpdate, or session tickets the server sends before anything else), the read that consumes them waits for the peer's next record, and writes wait with it; servers that send tickets right after the handshake also send their first response or HTTP/2 SETTINGS, which ends the wait. A non-blocking or buffer-based API in std's TLS would remove the thread, the pair and this case.
+
 ## Development
 
 ```bash
-rok test        # unit tests (RFC 3986 / 7541 vectors), smuggling cases, loopback h1 and h2
+rok test        # unit tests (RFC 3986 / 7541 vectors), smuggling cases, loopback h1 and h2, plain and TLS
 rok fmt --check
 ```

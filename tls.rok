@@ -1,0 +1,287 @@
+// TLS for `Io`, on `rok::std::net::tls`.
+//
+// std's TLS connection is blocking and must be driven by one thread at a
+// time, while HTTP/2 reads and writes at once. So each connection gets a
+// thread that owns the TLS state and runs one operation at a time, and
+// the TLS side talks to a loopback socket pair instead of the network:
+// async pumps move ciphertext between the pair and the real socket. The
+// inbound pump hands over whole records, and a read is only started once
+// a record is there, so it does not wait on the network and writes are
+// not stuck behind it.
+//
+// A read returns the plaintext of one application data record, after
+// any records without (session tickets, KeyUpdate). Which records it
+// used is told by length: TLS 1.3 adds 22 bytes to a record without
+// padding. Limits: a thread and a loopback pair per connection; when
+// only records without application data are pending, a read waits for
+// the peer's next record (and writes wait for that read).
+
+use rok::std::net;
+use rok::std::net::{TcpStream, Shutdown};
+use rok::std::net::tls;
+use rok::std::io::{IoError, byte_buf};
+
+const APPLICATION_DATA: u8 = 0x17u8;
+/// Header, content type and AEAD tag of a TLS 1.3 record.
+const OVERHEAD: usize = 22;
+
+pub(pkg) enum Op {
+    /// Read application data (records are there).
+    Read,
+    /// Write; the error message, or `""`, goes back on the sender.
+    Write(List<u8>, Sender<str>),
+    Close,
+}
+
+pub(pkg) enum In {
+    /// Handshake done; the negotiated ALPN protocol (empty: none).
+    Ready(List<u8>),
+    Data(List<u8>),
+    End,
+    Failed(str),
+}
+
+/// Who we are in the handshake.
+pub(pkg) enum Side {
+    Client(str, tls::ClientConfig),
+    Server(tls::ServerConfig),
+}
+
+struct Setup {
+    sock: TcpStream;
+    side: Side;
+    ops: Receiver<Op>;
+    out: Sender<In>;
+}
+
+/// The async end of a TLS connection. Copies share it.
+pub(pkg) struct Link {
+    pub ops: Sender<Op>;
+    pub input: Receiver<In>;
+    /// Lengths of the records handed to the thread and not read yet.
+    pending: Mutex<List<usize>>;
+    /// A message per record handed over; closed at the network's end.
+    arrived: Receiver<i32>;
+}
+
+impl Link {
+    /// The next plaintext, or `End` / `Failed`.
+    pub async fn next(self) -> In {
+        loop {
+            let n = 0usize;
+            using g = self.pending.lock() { n = g.get().len(); }
+            if n > 0 { break; }
+            if await self.arrived.recv_async() is none { return In::End; }
+        }
+        try? self.ops.send(Op::Read);
+        let r = await self.input.recv_async() ?? In::End;
+        if let In::Data(d) = r {
+            using g = self.pending.lock() {
+                let p = g.get();
+                let used = 1usize;
+                for i in 0..p.len() {
+                    if p[i] == d.len() + OVERHEAD {
+                        used = i + 1;
+                        break;
+                    }
+                }
+                g.set(p[used:p.len()].to_list());
+            }
+        }
+        r
+    }
+}
+
+/// A connected loopback pair. The accepted end is checked against the
+/// connecting one, so another local process cannot take its place.
+async fn pair() throws (IoError) -> (TcpStream, TcpStream) {
+    using l = try net::tcp_listen("127.0.0.1:0") {
+        let mine = try await net::tcp_connect_async(try l.local_addr());
+        let want = try mine.local_addr();
+        loop {
+            let (theirs, from) = try await l.accept_async();
+            if from == want { return (theirs, mine); }
+            theirs.close();
+        }
+    }
+}
+
+/// Start TLS over `real`: handshake as `side`, then serve reads and
+/// writes. The first `In` is `Ready` or `Failed`.
+pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link {
+    let (inner, pipe) = try await pair();
+    let client = match side {
+        Side::Client(_, _) => true,
+        Side::Server(_) => false,
+    };
+    let (otx, orx) = channel::<Op>();
+    let (itx, irx) = channel::<In>();
+    let (stx, srx) = channel::<Setup>();
+    try! stx.send(Setup { sock: inner, side: side, ops: orx, out: itx });
+    rok::std::thread::spawn(|| {
+        if let s: Setup = srx.recv() { run(s); }
+        0
+    });
+    let post = Atomic::new(false);
+    let (atx, arx) = channel::<i32>();
+    let l = Link { ops: otx, input: irx, pending: Mutex::new(List::new()), arrived: arx };
+    task::spawn(async {
+        await inbound(real, pipe, l, atx, post, !client);
+        0
+    });
+    task::spawn(async {
+        await outbound(pipe, real, post, client);
+        0
+    });
+    l
+}
+
+// ---- the TLS thread ----
+
+fn tls_read(c: tls::Client | tls::Server, buf: List<u8>) throws (IoError) -> usize {
+    match c {
+        x: tls::Client => try x.read(buf),
+        x: tls::Server => try x.read(buf),
+    }
+}
+
+fn tls_write(c: tls::Client | tls::Server, data: List<u8>) throws (IoError) {
+    match c {
+        x: tls::Client => try x.write_all(data),
+        x: tls::Server => try x.write_all(data),
+    }
+}
+
+fn tls_close(c: tls::Client | tls::Server) {
+    match c {
+        x: tls::Client => x.close(),
+        x: tls::Server => x.close(),
+    }
+}
+
+fn run(s: Setup) {
+    let out = s.out;
+    let c: tls::Client | tls::Server = try {
+        match s.side {
+            Side::Client(name, cfg) => tls::Client::with_config(s.sock, name, cfg),
+            Side::Server(cfg) => tls::Server::new(s.sock, cfg),
+        }
+    } catch e: tls::TlsError {
+        s.sock.close();
+        try? out.send(In::Failed(e.msg));
+        return;
+    };
+    let alpn = match c {
+        x: tls::Client => x.negotiated_alpn(),
+        x: tls::Server => x.negotiated_alpn(),
+    };
+    try? out.send(In::Ready(alpn ?? []));
+    // A record's plaintext fits, so one read takes a whole record.
+    let buf = byte_buf(16640);
+    let ended = false;
+    loop {
+        let op = s.ops.recv() ?? Op::Close;
+        match op {
+            Op::Read => if !ended {
+                let n = try tls_read(c, buf) catch e: IoError {
+                    ended = true;
+                    try? out.send(In::Failed(e.message));
+                    continue;
+                };
+                if n == 0 {
+                    ended = true;
+                    try? out.send(In::End);
+                } else {
+                    try? out.send(In::Data(buf[0:n].to_list()));
+                }
+            },
+            Op::Write(data, ack) => {
+                let r = try {
+                    tls_write(c, data);
+                    ""
+                } catch e: IoError { e.message };
+                try? ack.send(r);
+            },
+            Op::Close => {
+                tls_close(c);
+                out.close();
+                while let x: Op = s.ops.try_recv() {
+                    if let Op::Write(_, ack) = x { try? ack.send("connection closed"); }
+                }
+                return;
+            },
+        }
+    }
+}
+
+// ---- pumps ----
+
+/// Network to the TLS thread, a whole record at a time. Records after
+/// the handshake are announced to `l`'s reader; a server's handshake
+/// ends with the client's first encrypted record (its Finished).
+async fn inbound(real: TcpStream, pipe: TcpStream, l: Link, arrived: Sender<i32>, post: Atomic<bool>, server: bool) {
+    let buf = byte_buf(16384);
+    let acc: List<u8> = List::new();
+    loop {
+        let n = try await real.read_async(buf) catch _ { 0usize };
+        if n == 0 { break; }
+        acc.extend(buf[0:n]);
+        let at = 0usize;
+        while acc.len() - at >= 5 {
+            let len = 5 + (((acc[at + 3] as usize) << 8) | acc[at + 4] as usize);
+            if acc.len() - at < len { break; }
+            let typ = acc[at];
+            try await pipe.write_all_async(acc[at:at + len]) catch _ {
+                arrived.close();
+                return;
+            };
+            at += len;
+            if post.load() {
+                using g = l.pending.lock() { g.get().push(len); }
+                try? arrived.send(1);
+            } else if server && typ == APPLICATION_DATA {
+                post.store(true);
+            }
+        }
+        acc = acc[at:acc.len()].to_list();
+    }
+    try? pipe.shutdown(Shutdown::Write);
+    arrived.close();
+}
+
+/// TLS thread to the network. A client's handshake ends with its first
+/// encrypted record: from then on the server's records are application
+/// data, and none of them can arrive before that record leaves.
+async fn outbound(pipe: TcpStream, real: TcpStream, post: Atomic<bool>, client: bool) {
+    let buf = byte_buf(65536);
+    // Bytes left of the current record, while watching for the first
+    // encrypted one.
+    let skip = 0usize;
+    let head: List<u8> = List::new();
+    loop {
+        let n = try await pipe.read_async(buf) catch _ { 0usize };
+        if n == 0 { break; }
+        if client && !post.load() {
+            let i = 0usize;
+            while i < n && !post.load() {
+                if skip > 0 {
+                    let k = if n - i < skip { n - i } else { skip };
+                    skip -= k;
+                    i += k;
+                    continue;
+                }
+                head.push(buf[i]);
+                i += 1;
+                if head.len() == 5 {
+                    if head[0] == APPLICATION_DATA { post.store(true); }
+                    skip = ((head[3] as usize) << 8) | head[4] as usize;
+                    head = List::new();
+                }
+            }
+        }
+        try await real.write_all_async(buf[0:n]) catch _ { break; };
+    }
+    try? real.shutdown(Shutdown::Both);
+    real.close();
+    pipe.close();
+}

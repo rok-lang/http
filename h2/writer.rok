@@ -2,8 +2,7 @@
 // write half, the HPACK encoder, the send windows and the stream
 // scheduler; everything else talks to it through `Cmd`s.
 
-use rok::std::net::{TcpStream, Shutdown};
-use pkg::conn::{Io, deadline_in};
+use pkg::conn::{Io, Wire, deadline_in};
 use pkg::h2::frame;
 use pkg::h2::frame::{Prio, MAX_WINDOW, FLOW_CONTROL_ERROR};
 use pkg::h2::hpack::Encoder;
@@ -41,8 +40,8 @@ fn tell(ack: Sender<i32> | none, v: i32) {
 }
 
 /// Run until `Close` and the channel's end.
-pub(pkg) async fn run(s: TcpStream, rx: Receiver<Cmd>, huffman: bool, timeout: Duration | none) {
-    let io = Io::new(s);
+pub(pkg) async fn run(wire: Wire, rx: Receiver<Cmd>, huffman: bool, timeout: Duration | none) {
+    let io = Io::of(wire);
     let w = W {
         enc: Encoder::new(huffman),
         wins: Dict::new(),
@@ -69,14 +68,14 @@ pub(pkg) async fn run(s: TcpStream, rx: Receiver<Cmd>, huffman: bool, timeout: D
             w.out = List::new();
             try await io.write(buf[0:buf.len()], deadline_in(timeout)) catch _ {
                 w.die();
-                try? s.shutdown(Shutdown::Both);
+                io.shutdown();
             };
         } else {
             w.out = List::new();
         }
         if w.closing() && !w.dead() {
             w.die();
-            try? s.shutdown(Shutdown::Both);
+            io.shutdown();
         }
     }
     w.die();

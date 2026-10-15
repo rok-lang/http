@@ -210,7 +210,7 @@ fn redirects_and_timeouts() {
         let quick = Client::new(ClientConfig { timeout: Duration::ms(100) });
         expect(await err_kind(quick, base + "/slow") == ErrorKind::Timeout, "timeout");
         expect(await err_kind(c, "http://127.0.0.1:1/") == ErrorKind::Io, "refused");
-        expect(await err_kind(c, "https://example.com/") == ErrorKind::Unsupported, "no TLS yet");
+        expect(await err_kind(c, "ftp://example.com/") == ErrorKind::Unsupported, "unknown scheme");
         await srv.shutdown();
     });
 }

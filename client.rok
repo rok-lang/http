@@ -1,8 +1,11 @@
-// The client: connection pool, HTTP/1.1 keep-alive, HTTP/2 by prior
-// knowledge, redirects, timeouts.
+// The client: connection pool, HTTP/1.1 keep-alive, HTTP/2 over TLS
+// (ALPN) or by prior knowledge, redirects, timeouts.
 
+use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, connect, deadline_in, earlier, spawn_with};
+use pkg::conn::{Io, connect, start_tls, deadline_in, earlier, spawn_with};
+use pkg::server::{H2, H11};
+use pkg::tls::Side;
 use pkg::error::{HttpError, ErrorKind};
 use pkg::h1;
 use pkg::h1::{Limits, Framing, Pumped, PumpOpts};
@@ -24,7 +27,8 @@ pub struct ClientConfig {
     /// Redirects followed; 0 returns 3xx responses as they are.
     pub max_redirects: u32 = 10u32;
     /// `Http11`, or `Http2` to speak HTTP/2 to `http` URLs by prior
-    /// knowledge (h2c). `https` URLs need TLS (not available yet).
+    /// knowledge (h2c). `https` URLs offer both through ALPN and use
+    /// HTTP/2 when the server picks it.
     pub version: Version = Version::Http11;
     /// Idle HTTP/1.1 connections kept per origin.
     pub max_idle_per_host: usize = 8;
@@ -46,6 +50,8 @@ pub struct Client {
     cfg: ClientConfig;
     pool: Mutex<Dict<str, List<Pooled>>>;
     h2: Mutex<Dict<str, h2::ClientConn>>;
+    /// The TLS settings, made on first use (reading the OS trust store).
+    tls: Mutex<List<tls::ClientConfig>>;
 }
 
 /// GET `url` with a default client.
@@ -57,7 +63,15 @@ pub(pkg) const STALE: str = "connection closed before the response";
 
 impl Client {
     pub fn new(cfg: ClientConfig | none = none) -> Client {
-        Client { cfg: cfg ?? ClientConfig {}, pool: Mutex::new(Dict::new()), h2: Mutex::new(Dict::new()) }
+        Client { cfg: cfg ?? ClientConfig {}, pool: Mutex::new(Dict::new()), h2: Mutex::new(Dict::new()), tls: Mutex::new(List::new()) }
+    }
+
+    /// A client using `tls_cfg` for `https` (trust anchors, suites;
+    /// ALPN is set by the client).
+    pub fn with_tls(tls_cfg: tls::ClientConfig, cfg: ClientConfig | none = none) -> Client {
+        let c = Client::new(cfg);
+        using g = c.tls.lock() { g.get().push(tls_cfg); }
+        c
     }
 
     pub async fn get(self, url: str) throws (HttpError) -> Response { try await self.send(try Request::get(url)) }
@@ -106,49 +120,62 @@ impl Client {
     /// One request / response, no redirects.
     pub async fn send_once(self, req: Request) throws (HttpError) -> Response {
         let u = req.uri;
-        if u.scheme == "https" { throw HttpError::new(ErrorKind::Unsupported, "https needs TLS, which is not available yet"); }
-        if u.scheme != "http" { throw HttpError::new(ErrorKind::Unsupported, f"unsupported scheme {u.scheme:?}"); }
+        let secure = u.scheme == "https";
+        if !secure && u.scheme != "http" { throw HttpError::new(ErrorKind::Unsupported, f"unsupported scheme {u.scheme:?}"); }
         let host = u.host ?? { throw HttpError::new(ErrorKind::Parse, f"no host in {u}"); };
         let port = u.port_or_default() ?? 80u16;
         let key = f"{u.scheme}://{u.authority()}";
         let deadline = deadline_in(self.cfg.timeout);
-        if self.cfg.version == Version::Http2 {
-            let c = try await self.h2_conn(key, host, port, deadline);
-            let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
-            let r = try await c.send(req, deadline) catch e: HttpError {
-                if !(replayable && e.message == STALE) { throw e; }
-                // Refused by GOAWAY or a closed connection: once more on a new one.
-                if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
-                let fresh = try await self.h2_conn(key, host, port, deadline);
-                return try await fresh.send(req, deadline);
-            };
-            return r;
+        let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
+        let found: h2::ClientConn | none = none;
+        using g = self.h2.lock() { found = g.get().get(key); }
+        if let c: h2::ClientConn = found {
+            if c.usable() {
+                let r = try await c.send(req, deadline) catch e: HttpError {
+                    if !(replayable && e.message == STALE) { throw e; }
+                    // Refused by GOAWAY or a closed connection: once more on a new one.
+                    if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
+                    return try await self.fresh(key, secure, host, port, req, deadline);
+                };
+                return r;
+            }
         }
         if let io: Io = self.checkout(key) {
-            let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
             let r = try await self.h1_exchange(io, key, req, deadline) catch e: HttpError {
                 io.close();
                 if !(replayable && (e.kind == ErrorKind::Io || e.message == STALE)) { throw e; }
                 if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
-                let fresh = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
-                return try await self.h1_exchange(fresh, key, req, deadline);
+                return try await self.fresh(key, secure, host, port, req, deadline);
             };
             return r;
         }
-        let io = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
+        try await self.fresh(key, secure, host, port, req, deadline)
+    }
+
+    /// `req` on a new connection: HTTP/2 when ALPN or the configuration
+    /// says so (the connection is then kept for later requests).
+    async fn fresh(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+        let cd = earlier(deadline, deadline_in(self.cfg.connect_timeout));
+        let io = try await connect(host, port, cd);
+        if secure {
+            let tc = self.tls_config();
+            tc.alpn_protocols = [H2.as_bytes().to_list(), H11.as_bytes().to_list()];
+            io = try await start_tls(io, Side::Client(host, tc), cd);
+        }
+        if secure && io.alpn == H2 || !secure && self.cfg.version == Version::Http2 {
+            let c = try await h2::ClientConn::start(io, self.cfg.h2, deadline);
+            using g = self.h2.lock() { g.get().insert(key, c); }
+            return try await c.send(req, deadline);
+        }
         try await self.h1_exchange(io, key, req, deadline)
     }
 
-    async fn h2_conn(self, key: str, host: str, port: u16, deadline: Instant | none) throws (HttpError) -> h2::ClientConn {
-        let found: h2::ClientConn | none = none;
-        using g = self.h2.lock() { found = g.get().get(key); }
-        if let c: h2::ClientConn = found {
-            if c.usable() { return c; }
+    fn tls_config(self) -> tls::ClientConfig {
+        using g = self.tls.lock() {
+            let l = g.get();
+            if l.is_empty() { l.push(tls::ClientConfig::new()); }
+            return l[0];
         }
-        let io = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
-        let c = try await h2::ClientConn::start(io, self.cfg.h2, deadline);
-        using g = self.h2.lock() { g.get().insert(key, c); }
-        c
     }
 
     /// Idle HTTP/1.1 connections pooled for `origin` (`http://host:port`).

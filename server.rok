@@ -1,11 +1,13 @@
 // The server: an accept loop, a task per connection, HTTP/1.1 with
-// keep-alive and pipelining, HTTP/2 by prior knowledge (h2c), graceful
-// shutdown.
+// keep-alive and pipelining, HTTP/2 over TLS (ALPN) or by prior
+// knowledge (h2c), graceful shutdown.
 
 use rok::std::net::{TcpListener, TcpStream, SocketAddr, Shutdown};
 use rok::std::io::IoError;
+use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, io_err, deadline_in, spawn_with};
+use pkg::conn::{Io, io_err, deadline_in, spawn_with, start_tls};
+use pkg::tls::Side;
 use pkg::error::{HttpError, ErrorKind};
 use pkg::h1;
 use pkg::h1::{Limits, Framing, Pumped, PumpOpts, DONE};
@@ -32,7 +34,8 @@ pub struct ServerConfig {
     /// Larger request bodies fail with `TooLarge` (the connection then
     /// closes).
     pub max_body: u64 | none = none;
-    /// Accept HTTP/2 with prior knowledge on plaintext connections.
+    /// Speak HTTP/2: offered as "h2" over TLS, by prior knowledge on
+    /// plaintext connections.
     pub http2: bool = true;
     /// HTTP/2 settings.
     pub h2: h2::Config = h2::Config {};
@@ -56,12 +59,20 @@ pub struct Server {
     conns: Mutex<Dict<u64, ConnEntry>>;
     stop_tx: Sender<i32>;
     stop_rx: Receiver<i32>;
+    /// TLS certificate and key; empty for plaintext.
+    tls: Mutex<List<tls::ServerConfig>>;
 }
 
 /// Serve `handler` on `addr` (`"127.0.0.1:8080"`) until the process
 /// ends.
 pub async fn serve(addr: str, handler: Handler) throws (HttpError) {
     let s = try Server::bind(addr, handler);
+    try await s.run();
+}
+
+/// Serve `handler` over TLS on `addr` until the process ends.
+pub async fn serve_tls(addr: str, tls_cfg: tls::ServerConfig, handler: Handler) throws (HttpError) {
+    let s = try Server::bind_tls(addr, handler, tls_cfg);
     try await s.run();
 }
 
@@ -96,7 +107,20 @@ impl Server {
             conns: Mutex::new(Dict::new()),
             stop_tx: tx,
             stop_rx: rx,
+            tls: Mutex::new(List::new()),
         }
+    }
+
+    /// `bind` for TLS with `tls_cfg`'s certificate and key; ALPN is set
+    /// by the server.
+    pub fn bind_tls(addr: str, handler: Handler, tls_cfg: tls::ServerConfig, cfg: ServerConfig | none = none) throws (HttpError) -> Server {
+        let s = try Server::bind(addr, handler, cfg);
+        using g = s.tls.lock() { g.get().push(tls_cfg); }
+        s
+    }
+
+    fn tls_config(self) -> tls::ServerConfig | none {
+        using g = self.tls.lock() { return g.get().first(); }
     }
 
     pub fn local_addr(self) throws (HttpError) -> SocketAddr {
@@ -181,9 +205,18 @@ impl Server {
         let id = self.ids.fetch_add(1u64);
         self.set_entry(id, ConnEntry { s: s, idle: true, drain: none });
         let io = Io::new(s);
-        if !self.stopping.load() {
+        let ok = !self.stopping.load();
+        let secure = self.tls_config();
+        if let tc: tls::ServerConfig = secure {
+            tc.alpn_protocols = if self.cfg.http2 { [H2.as_bytes().to_list(), H11.as_bytes().to_list()] } else { [H11.as_bytes().to_list()] };
+            io = try await start_tls(io, Side::Server(tc), deadline_in(self.cfg.header_timeout)) catch _ {
+                ok = false;
+                io
+            };
+        }
+        if ok {
             let is_h2 = false;
-            if self.cfg.http2 {
+            if secure is none && self.cfg.http2 || io.alpn == H2 {
                 is_h2 = try await sniff_preface(io, deadline_in(self.cfg.header_timeout)) catch _ { false };
             }
             if is_h2 {
@@ -270,6 +303,10 @@ impl Server {
         try await write_response(io, resp, head.method, head.version, k, cfg.io_timeout)
     }
 }
+
+/// ALPN protocol ids.
+pub(pkg) const H2: str = "h2";
+pub(pkg) const H11: str = "http/1.1";
 
 const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 

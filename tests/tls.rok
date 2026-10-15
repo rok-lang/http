@@ -1,0 +1,94 @@
+// HTTPS on loopback: ALPN picks HTTP/1.1 or HTTP/2, certificates are
+// checked. tests/tls/ holds an Ed25519 CA and a leaf for localhost and
+// 127.0.0.1 (valid to 2126).
+
+use rok::std::fs;
+use rok::std::net::tls;
+use pkg::*;
+use sup::expect;
+use sup::h1::test_handler;
+
+fn server_tls() -> tls::ServerConfig {
+    let chain = try! tls::Certificate::from_pem(try! fs::read_to_str("tests/tls/cert.pem"));
+    tls::ServerConfig::new(chain, try! tls::PrivateKey::from_pem(try! fs::read_to_str("tests/tls/key.pem")))
+}
+
+fn trusting() -> Client {
+    let cfg = tls::ClientConfig::new();
+    cfg.root_certs = try! tls::Certificate::from_pem(try! fs::read_to_str("tests/tls/ca.pem"));
+    Client::with_tls(cfg)
+}
+
+fn start_tls(cfg: ServerConfig | none = none) -> (Server, str) {
+    let s = try! Server::bind_tls("127.0.0.1:0", test_handler, server_tls(), cfg);
+    let a = try! s.local_addr();
+    task::spawn(async {
+        try! await s.run();
+        0
+    });
+    (s, f"https://{a}")
+}
+
+#[test]
+fn https_h1() {
+    task::block_on(async {
+        let (srv, base) = start_tls(ServerConfig { http2: false });
+        let c = trusting();
+        let r = try! await c.get(base + "/hi?x=1");
+        expect(r.version == Version::Http11 && r.status == StatusCode::OK, "status");
+        expect((try! await r.body.text()).starts_with("GET /hi?x=1 HTTP/1.1 host=127.0.0.1:"), "body");
+        let e = try! await c.send((try! Request::post(base + "/echo")).text("ping"));
+        expect(try! await e.body.text() == "ping", "echo");
+        let big = try! await c.get(base + "/big");
+        let bb = try! await big.body.bytes();
+        expect(bb.len() == 200000 && bb[199999] == (199999 % 251) as u8, f"big {bb.len()}");
+        let s = try! await c.get(base + "/stream");
+        expect((try! await s.body.text()).lines().count() == 50, "chunked");
+        expect(c.idle_count(base) == 1, "kept alive");
+        let r2 = try! await c.get(base + "/redirect");
+        expect((try! await r2.body.text()).starts_with("GET /final?from=r HTTP/1.1"), "redirect");
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn https_h2() {
+    task::block_on(async {
+        let (srv, base) = start_tls();
+        let c = trusting();
+        let r = try! await c.get(base + "/hi");
+        expect(r.version == Version::Http2 && r.status == StatusCode::OK, "h2 chosen by ALPN");
+        expect((try! await r.body.text()).starts_with("GET /hi HTTP/2 host=127.0.0.1:"), "body");
+        let up: List<u8> = List::with_capacity(3000000);
+        for i in 0..3000000 { up.push((i % 7) as u8); }
+        let u = try! await c.send((try! Request::post(base + "/echo")).with_body(Body::from_bytes(up)));
+        expect((try! await u.body.bytes()).len() == 3000000, "upload");
+        let tasks: List<Task<bool>> = List::new();
+        for i in 0..20 {
+            tasks.push(task::spawn(async {
+                let r = try! await c.get(base + f"/n{i}");
+                (try! await r.body.text()).starts_with(f"GET /n{i} ")
+            }));
+        }
+        let ok = 0;
+        for x in await task::join(tasks) {
+            if x { ok += 1; }
+        }
+        expect(ok == 20, f"concurrent {ok}");
+        let slow = task::spawn(async { (try! await c.get(base + "/slow")).status.as_u16() });
+        await task::sleep(Duration::ms(100));
+        await srv.shutdown();
+        expect(await slow == 200u16, "in-flight stream completed after GOAWAY");
+    });
+}
+
+#[test]
+fn https_untrusted() {
+    task::block_on(async {
+        let (srv, base) = start_tls();
+        // The OS trust store does not know the test CA.
+        let k = await sup::h1::err_kind(Client::new(), base + "/");
+        expect(k == ErrorKind::Tls, f"{k:?}");
+        await srv.shutdown();
+    });
+}

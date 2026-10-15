@@ -1,5 +1,5 @@
-// HTTP/2 (RFC 9113) over a plaintext connection with prior knowledge
-// (h2c); the same engine serves TLS once ALPN "h2" is available.
+// HTTP/2 (RFC 9113) over TLS (ALPN "h2") or a plaintext connection with
+// prior knowledge (h2c).
 //
 // Per connection: the reading task (frames in, HPACK decoder, receive
 // flow control), a writer task (`writer::run`: frames out, HPACK
@@ -12,9 +12,8 @@ pub(pkg) mod huffman;
 pub(pkg) mod hpack;
 mod writer;
 
-use rok::std::net::{TcpStream, Shutdown};
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, deadline_in, left, spawn_with};
+use pkg::conn::{Io, Wire, deadline_in, left, spawn_with};
 use pkg::error::{HttpError, ErrorKind};
 use pkg::h1;
 use pkg::h1::recv_within;
@@ -83,7 +82,6 @@ pub(pkg) struct Shared {
     st: Mutex<State>;
     w: Sender<Cmd>;
     credit: Sender<(u32, usize)>;
-    s: TcpStream;
     cfg: Config;
     server: bool;
     /// The writer task: done once everything queued is written.
@@ -96,16 +94,16 @@ fn reset_err(code: u32) -> HttpError { HttpError { kind: ErrorKind::Reset, messa
 
 impl Shared {
     /// Start the writer and credit tasks and queue our preface settings.
-    fn new(s: TcpStream, cfg: Config, server: bool) -> Shared {
+    fn new(w: Wire, cfg: Config, server: bool) -> Shared {
         let (wtx, wrx) = channel::<Cmd>();
         let (ctx, crx) = channel::<(u32, usize)>();
         let huff = cfg.huffman;
         let wt = cfg.write_timeout;
         let wtask = task::spawn(async {
-            await writer::run(s, wrx, huff, wt);
+            await writer::run(w, wrx, huff, wt);
             0
         });
-        let sh = Shared { st: Mutex::new(State { streams: Dict::new() }), w: wtx, credit: ctx, s: s, cfg: cfg, server: server, wtask: wtask };
+        let sh = Shared { st: Mutex::new(State { streams: Dict::new() }), w: wtx, credit: ctx, cfg: cfg, server: server, wtask: wtask };
         task::spawn(async {
             await sh.credits(crx);
             0
@@ -784,7 +782,7 @@ fn parse_response(fields: List<(str, str)>) throws (HttpError) -> Response {
 /// `drain`: a message starts a graceful shutdown.
 pub(pkg) async fn serve_conn(io: Io, handler: Handler, cfg: Config, drain: Receiver<i32>) {
     io.consume(frame::PREFACE.len());
-    let sh = Shared::new(io.s, cfg, true);
+    let sh = Shared::new(io.wire(), cfg, true);
     task::spawn(async {
         if await drain.recv_async() is i32 { sh.drain(); }
         0
@@ -801,7 +799,7 @@ impl ClientConn {
     /// Send the preface and settings over `io` and start reading.
     pub async fn start(io: Io, cfg: Config, deadline: Instant | none) throws (HttpError) -> ClientConn {
         try await io.write(frame::PREFACE.as_bytes(), deadline);
-        let sh = Shared::new(io.s, cfg, false);
+        let sh = Shared::new(io.wire(), cfg, false);
         spawn_with(io, async |c: Io| {
             await sh.read_loop(c, none);
             c.close();

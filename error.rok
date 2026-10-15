@@ -17,8 +17,11 @@ pub enum ErrorKind {
     Reset,
     /// Too many redirects, or a redirect that cannot be followed.
     Redirect,
-    /// Something this library does not do (an `https` URL before TLS).
+    /// Something this library does not do (an unknown URL scheme).
     Unsupported,
+    /// The TLS handshake failed (an untrusted certificate, no common
+    /// parameters).
+    Tls,
     /// A socket error.
     Io,
 }
