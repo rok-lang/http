@@ -1,26 +1,33 @@
 // HTTPS on loopback: ALPN picks HTTP/1.1 or HTTP/2, certificates are
-// checked. tests/tls/ holds an Ed25519 CA and a leaf for localhost and
-// 127.0.0.1 (valid to 2126).
+// checked, a peer's KeyUpdate does not hold up writes. tests/tls/ holds
+// an ECDSA P-256 CA and two leaves for localhost and 127.0.0.1 (valid to
+// 2126): P-256 (`cert.pem`) and Ed25519.
 
 use rok::std::fs;
+use rok::std::net;
 use rok::std::net::tls;
+use rok::std::io::byte_buf;
 use pkg::*;
+use pkg::conn::{Io, connect, start_tls};
+use pkg::tls::Side;
 use sup::expect;
 use sup::h1::test_handler;
 
-fn server_tls() -> tls::ServerConfig {
-    let chain = try! tls::Certificate::from_pem(try! fs::read_to_str("tests/tls/cert.pem"));
-    tls::ServerConfig::new(chain, try! tls::PrivateKey::from_pem(try! fs::read_to_str("tests/tls/key.pem")))
+fn server_tls(leaf: str = "") -> tls::ServerConfig {
+    let chain = try! tls::Certificate::from_pem(try! fs::read_to_str(f"tests/tls/{leaf}cert.pem"));
+    tls::ServerConfig::new(chain, try! tls::PrivateKey::from_pem(try! fs::read_to_str(f"tests/tls/{leaf}key.pem")))
 }
 
-fn trusting() -> Client {
+fn client_tls() -> tls::ClientConfig {
     let cfg = tls::ClientConfig::new();
     cfg.root_certs = try! tls::Certificate::from_pem(try! fs::read_to_str("tests/tls/ca.pem"));
-    Client::with_tls(cfg)
+    cfg
 }
 
-fn start_tls(cfg: ServerConfig | none = none) -> (Server, str) {
-    let s = try! Server::bind_tls("127.0.0.1:0", test_handler, server_tls(), cfg);
+fn trusting() -> Client { Client::with_tls(client_tls()) }
+
+fn serve_https(cfg: ServerConfig | none = none, leaf: str = "") -> (Server, str) {
+    let s = try! Server::bind_tls("127.0.0.1:0", test_handler, server_tls(leaf), cfg);
     let a = try! s.local_addr();
     task::spawn(async {
         try! await s.run();
@@ -32,7 +39,7 @@ fn start_tls(cfg: ServerConfig | none = none) -> (Server, str) {
 #[test]
 fn https_h1() {
     task::block_on(async {
-        let (srv, base) = start_tls(ServerConfig { http2: false });
+        let (srv, base) = serve_https(ServerConfig { http2: false });
         let c = trusting();
         let r = try! await c.get(base + "/hi?x=1");
         expect(r.version == Version::Http11 && r.status == StatusCode::OK, "status");
@@ -54,7 +61,7 @@ fn https_h1() {
 #[test]
 fn https_h2() {
     task::block_on(async {
-        let (srv, base) = start_tls();
+        let (srv, base) = serve_https();
         let c = trusting();
         let r = try! await c.get(base + "/hi");
         expect(r.version == Version::Http2 && r.status == StatusCode::OK, "h2 chosen by ALPN");
@@ -85,10 +92,53 @@ fn https_h2() {
 #[test]
 fn https_untrusted() {
     task::block_on(async {
-        let (srv, base) = start_tls();
+        let (srv, base) = serve_https();
         // The OS trust store does not know the test CA.
         let k = await sup::h1::err_kind(Client::new(), base + "/");
         expect(k == ErrorKind::Tls, f"{k:?}");
         await srv.shutdown();
     });
+}
+
+#[test]
+fn https_ed25519() {
+    task::block_on(async {
+        let (srv, base) = serve_https(none, "ed25519-");
+        let r = try! await trusting().get(base + "/ed");
+        expect(r.version == Version::Http2 && (try! await r.body.text()).starts_with("GET /ed HTTP/2"), "Ed25519 leaf");
+        await srv.shutdown();
+    });
+}
+
+/// The peer sends a KeyUpdate and nothing else while we wait to read:
+/// our write must still go out.
+#[test]
+fn key_update_does_not_block_writes() {
+    task::block_on(async {
+        let l = try! net::tcp_listen("127.0.0.1:0");
+        let addr = try! l.local_addr();
+        let peer = task::spawn_local(async {
+            let (s, _) = try! await l.accept_async();
+            let t = try! await tls::Server::new_async(s, server_tls());
+            try! await t.key_update_async();
+            let buf = byte_buf(16);
+            let n = try! await t.read_async(buf);
+            try! await t.write_all_async(f"got {try! str::from_utf8(buf[0:n])}");
+            try! await t.close_notify_async();
+            0
+        });
+        let io = try! await connect("127.0.0.1", addr.port(), none);
+        io = try! await start_tls(io, Side::Client("localhost", client_tls()), none);
+        let reading = spawn_read(io);
+        await task::sleep(Duration::ms(100));
+        try! await io.write("ping".as_bytes(), Instant::now().checked_add(Duration::sec(2)));
+        expect(await reading, "read after the KeyUpdate");
+        expect(try! str::from_utf8(io.peek()) == "got ping", "reply");
+        io.close();
+        await peer;
+    });
+}
+
+fn spawn_read(io: Io) -> Task<bool> {
+    task::spawn_local(async { try! await io.fill(Instant::now().checked_add(Duration::sec(5))) })
 }

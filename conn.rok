@@ -82,30 +82,23 @@ pub(pkg) async fn start_tls(io: Io, side: Side, deadline: Instant | none) throws
         io.close();
         throw HttpError::new(ErrorKind::Unsupported, "TLS needs the `tls` feature");
     }
-    let l = try await pkg::tls::start(io.s, side) catch e: IoError {
-        io.close();
-        throw io_err(e);
-    };
-    let t = Io { s: io.s, st: io.st, t: l };
-    let first = await within(ready_res(l), deadline, "TLS handshake");
-    match first {
+    match await within(start_res(io.s, side), deadline, "TLS handshake") {
+        Result::Ok(r) => match r {
+            l: Link => Io { s: io.s, st: io.st, t: l, alpn: l.alpn },
+            m: str => {
+                io.close();
+                throw HttpError::new(ErrorKind::Tls, m);
+            },
+        },
         Result::Err(e) => {
-            t.close();
+            io.close();
             throw io_err(e);
         },
-        Result::Ok(In::Ready(a)) => {
-            t.alpn = try str::from_utf8(a) catch _ { "" };
-            t
-        },
-        Result::Ok(In::Failed(m)) => {
-            t.close();
-            throw HttpError::new(ErrorKind::Tls, m);
-        },
-        _ => {
-            t.close();
-            throw HttpError::new(ErrorKind::Closed, "connection closed during the TLS handshake");
-        },
     }
+}
+
+async fn start_res(s: TcpStream, side: Side) -> Result<Link | str, IoError> {
+    try Result::Ok(await pkg::tls::start(s, side)) catch e: IoError { Result::Err(e) }
 }
 
 async fn recv_in(l: Link, deadline: Instant | none) throws (HttpError) -> In {
@@ -115,8 +108,6 @@ async fn recv_in(l: Link, deadline: Instant | none) throws (HttpError) -> In {
         Result::Err(e) => throw io_err(e),
     }
 }
-
-async fn ready_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.input.recv_async() ?? In::End) }
 
 async fn next_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.next()) }
 

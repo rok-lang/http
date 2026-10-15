@@ -5,7 +5,7 @@ HTTP/1.1 ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) / [RFC 9112](https:
 - **Model**: `Method`, `StatusCode`, `HeaderMap` (case-insensitive multimap in insertion order), `Uri` (RFC 3986 parsing, normalization, reference resolution, percent-encoding), `application/x-www-form-urlencoded`, cookies (RFC 6265 `Cookie` / `Set-Cookie`), `Request` / `Response` with streaming `Body`s.
 - **HTTP/1.1**: keep-alive, pipelining, chunked bodies (extensions and trailers accepted), `Expect: 100-continue`, size limits and timeouts, graceful shutdown. Parsing is strict where leniency enables request smuggling or response splitting (see below).
 - **HTTP/2**: client and server with prior knowledge over plaintext (h2c), HPACK with Huffman coding, stream and connection flow control, RFC 9218 priorities (`priority` header and `PRIORITY_UPDATE`) for response scheduling, SETTINGS / PING / GOAWAY / RST_STREAM handling, graceful shutdown with GOAWAY. Server push is not implemented (the client disables it).
-- **TLS**: `https` URLs (SNI, certificates checked against the OS trust store or your roots) and a TLS server, both on std's TLS 1.3. ALPN offers `h2` and `http/1.1`; HTTP/2 is used when the server picks it. Servers need an Ed25519 certificate for now (std's limit). See [TLS internals](#tls-internals) for the costs.
+- **TLS**: `https` URLs (SNI, certificates checked against the OS trust store or your roots) and a TLS server, both on std's TLS 1.3. ALPN offers `h2` and `http/1.1`; HTTP/2 is used when the server picks it. Server keys: ECDSA P-256 / P-384, RSA-PSS or Ed25519 (std's set). See [TLS internals](#tls-internals).
 
 ## Usage
 
@@ -129,9 +129,7 @@ Outgoing header values are checked (`HeaderMap::validate`) so CR / LF cannot inj
 
 ## TLS internals
 
-`rok::std::net::tls` connections are blocking and must not be read and written from two threads at once, while HTTP/2 does both. So each TLS connection gets its own thread that owns the TLS state and runs one read or write at a time, talking to the network through a loopback socket pair whose other end async tasks copy to and from the real socket. A read is only started once a whole record has arrived, so reads do not wait on the network and writes do not wait behind them.
-
-Costs and limits: one thread and one loopback socket pair per TLS connection, and an extra copy of every byte. If the only records pending carry no application data (a lone KeyUpdate, or session tickets the server sends before anything else), the read that consumes them waits for the peer's next record, and writes wait with it; servers that send tickets right after the handshake also send their first response or HTTP/2 SETTINGS, which ends the wait. A non-blocking or buffer-based API in std's TLS would remove the thread, the pair and this case.
+A `rok::std::net::tls` connection runs one operation at a time, while HTTP/2 reads and writes at once. Each TLS connection therefore gets a reader task and a writer task pinned to one worker (`task::spawn_local`), using std's `*_async` methods. A pinned task gives way only at an await, and std keeps the connection state whole across those, so a read waiting for input (or handling a KeyUpdate) never holds up a write. The rest of the package talks to the two tasks over channels.
 
 ## Development
 
