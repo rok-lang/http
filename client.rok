@@ -1,0 +1,275 @@
+// The client: connection pool, HTTP/1.1 keep-alive, HTTP/2 by prior
+// knowledge, redirects, timeouts.
+
+use pkg::body::{Body, Chunk};
+use pkg::conn::{Io, connect, deadline_in, earlier, spawn_with};
+use pkg::error::{HttpError, ErrorKind};
+use pkg::h1;
+use pkg::h1::{Limits, Framing, Pumped, PumpOpts};
+use pkg::h2;
+use pkg::headers::HeaderMap;
+use pkg::message::{Request, Response, Version};
+use pkg::method::Method;
+use pkg::status::StatusCode;
+use pkg::uri::Uri;
+
+/// Client settings. Every field has a default.
+#[derive(Clone)]
+pub struct ClientConfig {
+    /// Time from sending a request to its response head (per hop).
+    pub timeout: Duration | none = Duration::sec(30);
+    pub connect_timeout: Duration | none = Duration::sec(10);
+    /// Longest wait for one read of a response body.
+    pub read_timeout: Duration | none = Duration::sec(30);
+    /// Redirects followed; 0 returns 3xx responses as they are.
+    pub max_redirects: u32 = 10u32;
+    /// `Http11`, or `Http2` to speak HTTP/2 to `http` URLs by prior
+    /// knowledge (h2c). `https` URLs need TLS (not available yet).
+    pub version: Version = Version::Http11;
+    /// Idle HTTP/1.1 connections kept per origin.
+    pub max_idle_per_host: usize = 8;
+    /// Idle connections older than this are not reused.
+    pub idle_timeout: Duration = Duration::sec(90);
+    /// Sent as `User-Agent` unless the request has one.
+    pub user_agent: str | none = "rok-http/0.1";
+    pub limits: Limits = Limits {};
+    pub h2: h2::Config = h2::Config {};
+}
+
+struct Pooled {
+    io: Io;
+    since: Instant;
+}
+
+/// An HTTP client. Copies share the connection pool.
+pub struct Client {
+    cfg: ClientConfig;
+    pool: Mutex<Dict<str, List<Pooled>>>;
+    h2: Mutex<Dict<str, h2::ClientConn>>;
+}
+
+/// GET `url` with a default client.
+pub async fn get(url: str) throws (HttpError) -> Response { try await Client::new().get(url) }
+
+/// The marker of a failure before the request reached a server: an
+/// idle pooled connection the server had closed.
+const STALE: str = "connection closed before the response";
+
+impl Client {
+    pub fn new(cfg: ClientConfig | none = none) -> Client {
+        Client { cfg: cfg ?? ClientConfig {}, pool: Mutex::new(Dict::new()), h2: Mutex::new(Dict::new()) }
+    }
+
+    pub async fn get(self, url: str) throws (HttpError) -> Response { try await self.send(try Request::get(url)) }
+
+    /// Send `req`, following redirects as configured.
+    pub async fn send(self, req: Request) throws (HttpError) -> Response {
+        let r = req;
+        let hops = 0u32;
+        loop {
+            let resp = try await self.send_once(r);
+            let code = resp.status.as_u16();
+            let redirect = code == 301u16 || code == 302u16 || code == 303u16 || code == 307u16 || code == 308u16;
+            if !redirect || self.cfg.max_redirects == 0u32 { return resp; }
+            let loc = match resp.headers.get("location") {
+                l: str => l,
+                none => return resp,
+            };
+            if hops >= self.cfg.max_redirects { throw HttpError::new(ErrorKind::Redirect, f"more than {hops} redirects"); }
+            let next = try r.uri.join(loc) catch _ { throw HttpError::new(ErrorKind::Redirect, f"invalid Location {loc:?}"); };
+            next.fragment = r.uri.fragment;
+            let to_get = code == 303u16 && r.method != Method::HEAD || (code == 301u16 || code == 302u16) && r.method == Method::POST;
+            let n = Request::new(if to_get { Method::GET } else { r.method }, next);
+            n.headers = r.headers.clone();
+            if to_get {
+                n.headers.remove("content-type");
+                n.headers.remove("content-length");
+            } else if !r.body.is_empty() {
+                match r.body.replayable() {
+                    b: List<u8> => { n.body = Body::from_bytes(b); },
+                    none => return resp,
+                }
+            }
+            if next.scheme != r.uri.scheme || next.authority() != r.uri.authority() {
+                n.headers.remove("authorization");
+                n.headers.remove("proxy-authorization");
+                n.headers.remove("cookie");
+            }
+            n.headers.remove("host");
+            // Let the connection go back to the pool.
+            try? await resp.body.bytes(65536);
+            r = n;
+            hops += 1u32;
+        }
+    }
+
+    /// One request / response, no redirects.
+    pub async fn send_once(self, req: Request) throws (HttpError) -> Response {
+        let u = req.uri;
+        if u.scheme == "https" { throw HttpError::new(ErrorKind::Unsupported, "https needs TLS, which is not available yet"); }
+        if u.scheme != "http" { throw HttpError::new(ErrorKind::Unsupported, f"unsupported scheme {u.scheme:?}"); }
+        let host = u.host ?? { throw HttpError::new(ErrorKind::Parse, f"no host in {u}"); };
+        let port = u.port_or_default() ?? 80u16;
+        let key = f"{u.scheme}://{u.authority()}";
+        let deadline = deadline_in(self.cfg.timeout);
+        if self.cfg.version == Version::Http2 {
+            let c = try await self.h2_conn(key, host, port, deadline);
+            return try await c.send(req, deadline);
+        }
+        if let io: Io = self.checkout(key) {
+            let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
+            let r = try await self.h1_exchange(io, key, req, deadline) catch e: HttpError {
+                io.close();
+                if !(replayable && (e.kind == ErrorKind::Io || e.message == STALE)) { throw e; }
+                if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
+                let fresh = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
+                return try await self.h1_exchange(fresh, key, req, deadline);
+            };
+            return r;
+        }
+        let io = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
+        try await self.h1_exchange(io, key, req, deadline)
+    }
+
+    async fn h2_conn(self, key: str, host: str, port: u16, deadline: Instant | none) throws (HttpError) -> h2::ClientConn {
+        let found: h2::ClientConn | none = none;
+        using g = self.h2.lock() { found = g.get().get(key); }
+        if let c: h2::ClientConn = found {
+            if c.usable() { return c; }
+        }
+        let io = try await connect(host, port, earlier(deadline, deadline_in(self.cfg.connect_timeout)));
+        let c = try await h2::ClientConn::start(io, self.cfg.h2, deadline);
+        using g = self.h2.lock() { g.get().insert(key, c); }
+        c
+    }
+
+    /// Idle HTTP/1.1 connections pooled for `origin` (`http://host:port`).
+    pub fn idle_count(self, origin: str) -> usize {
+        let n = 0usize;
+        using g = self.pool.lock() {
+            if let l: List<Pooled> = g.get().get(origin) { n = l.len(); }
+        }
+        n
+    }
+
+    fn checkout(self, key: str) -> Io | none {
+        using g = self.pool.lock() {
+            let l = g.get().get(key) ?? { return none; };
+            while let p: Pooled = l.pop() {
+                if p.since.elapsed() < self.cfg.idle_timeout && p.io.buffered() == 0 { return p.io; }
+                p.io.close();
+            }
+        }
+        none
+    }
+
+    fn checkin(self, key: str, io: Io) {
+        using g = self.pool.lock() {
+            let d = g.get();
+            let l = d.get(key) ?? List::<Pooled>::new();
+            if l.len() < self.cfg.max_idle_per_host {
+                l.push(Pooled { io: io, since: Instant::now() });
+                d.insert(key, l);
+                return;
+            }
+        }
+        io.close();
+    }
+
+    async fn h1_exchange(self, io: Io, key: str, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+        let cfg = self.cfg;
+        try req.headers.validate();
+        let u = req.uri;
+        let out = StrBuf::new();
+        out.push_str(f"{req.method} {u.path_and_query()} HTTP/1.1\r\n");
+        if !req.headers.contains("host") { out.push_str(f"host: {u.authority()}\r\n"); }
+        if !req.headers.contains("user-agent") {
+            if let ua: str = cfg.user_agent { out.push_str(f"user-agent: {ua}\r\n"); }
+        }
+        let skip: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te"];
+        h1::push_fields(out, req.headers, skip);
+        let body = req.body;
+        let chunked = false;
+        match body.len() {
+            n: u64 => if n > 0u64 || req.method == Method::POST || req.method == Method::PUT || req.method == Method::PATCH {
+                out.push_str(f"content-length: {n}\r\n");
+            },
+            none => {
+                out.push_str("transfer-encoding: chunked\r\n");
+                chunked = true;
+            },
+        }
+        out.push_str("\r\n");
+        let head = out.to_str();
+        try {
+            match body.replayable() {
+                b: List<u8> => try await io.write(h1::concat(head, b)[0:head.len() + b.len()], deadline),
+                none => {
+                    try await io.write(head.as_bytes(), deadline);
+                    if !body.is_empty() {
+                        loop {
+                            let c = try await body.chunk();
+                            match c {
+                                b: List<u8> => {
+                                    if chunked {
+                                        let framed = h1::concat(f"{b.len():x}\r\n", b);
+                                        framed.push(0x0Du8);
+                                        framed.push(0x0Au8);
+                                        try await io.write(framed[0:framed.len()], deadline);
+                                    } else {
+                                        try await io.write(b[0:b.len()], deadline);
+                                    }
+                                },
+                                none => break,
+                            }
+                        }
+                        if chunked { try await io.write("0\r\n\r\n".as_bytes(), deadline); }
+                    }
+                },
+            }
+        } catch e: HttpError {
+            if e.kind == ErrorKind::Io { throw HttpError::new(ErrorKind::Closed, STALE); }
+            throw e;
+        };
+        let rh: h1::RespHead = h1::RespHead { status: 0u16, version: Version::Http11, headers: HeaderMap::new() };
+        loop {
+            let block = try await h1::read_block(io, cfg.limits.max_head, deadline, deadline);
+            let b = match block {
+                x: List<u8> => x,
+                none => throw HttpError::new(ErrorKind::Closed, STALE),
+            };
+            rh = try h1::parse_response_head(b, cfg.limits);
+            if rh.status == 101u16 { throw HttpError::new(ErrorKind::Unsupported, "protocol switch (101) is not supported"); }
+            if rh.status >= 200u16 { break; }
+        }
+        let fr = try h1::response_framing(req.method, rh);
+        let reusable = if rh.version == Version::Http11 {
+            !rh.headers.has_token("connection", "close")
+        } else {
+            rh.headers.has_token("connection", "keep-alive")
+        };
+        let resp = Response { status: try StatusCode::new(rh.status), version: rh.version, headers: rh.headers, body: Body::empty() };
+        match fr {
+            Framing::Empty => {
+                if reusable { self.checkin(key, io); } else { io.close(); }
+                return resp;
+            },
+            _ => {},
+        }
+        let len: u64 | none = match fr {
+            Framing::Length(n) => n,
+            _ => none,
+        };
+        let (tx, rx) = channel::<Chunk>();
+        let (ctx, crx) = channel::<(u32, usize)>();
+        resp.body = Body::pulled(rx, ctx, 1u32, len);
+        let me = self;
+        let opts = PumpOpts { read_timeout: cfg.read_timeout, want_timeout: cfg.idle_timeout };
+        spawn_with(io, async |c: Io| {
+            let p = await h1::pump(c, fr, tx, crx, opts);
+            if p == Pumped::Complete && reusable { me.checkin(key, c); } else { c.close(); }
+            0
+        });
+        resp
+    }
+}

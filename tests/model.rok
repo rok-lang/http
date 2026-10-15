@@ -1,0 +1,137 @@
+// Message model tests.
+
+use pkg::*;
+use sup::{expect, fails};
+
+fn uri(s: str) -> Uri { try Uri::parse(s) catch e { panic(f"{s}: {e}"); } }
+
+#[test]
+fn uri_parse() {
+    let u = uri("http://user:pw@Example.COM:8080/a/b?x=1&y=2#frag");
+    expect(u.scheme == "http" && u.userinfo == "user:pw" && u.host == "Example.COM", "parts");
+    expect(u.port == 8080u16 && u.path == "/a/b" && u.query == "x=1&y=2" && u.fragment == "frag", "rest");
+    expect(f"{u}" == "http://user:pw@Example.COM:8080/a/b?x=1&y=2#frag", "round trip");
+    let v6 = uri("http://[::1]:80/");
+    expect(v6.host == "::1" && v6.authority() == "[::1]:80", "ipv6");
+    let rel = uri("/p?q");
+    expect(rel.scheme == "" && rel.host is none && rel.path_and_query() == "/p?q", "relative");
+    for bad in ["http://a b/", "http://h:99999/", "/a%zz", "http://[::g]/", "/a\nb", "1x:y", "a:b/c d"] {
+        expect((try? Uri::parse(bad)) is none, f"reject {bad:?}");
+    }
+    expect(uri("mailto:a@b.c").path == "a@b.c", "opaque");
+}
+
+#[test]
+fn uri_resolve_rfc3986() {
+    // RFC 3986 5.4.1 and 5.4.2.
+    let base = uri("http://a/b/c/d;p?q");
+    let cases = [
+        ("g:h", "g:h"), ("g", "http://a/b/c/g"), ("./g", "http://a/b/c/g"), ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"), ("//g", "http://g"), ("?y", "http://a/b/c/d;p?y"), ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"), ("g#s", "http://a/b/c/g#s"), ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"), ("g;x", "http://a/b/c/g;x"), ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+        ("", "http://a/b/c/d;p?q"), (".", "http://a/b/c/"), ("./", "http://a/b/c/"), ("..", "http://a/b/"),
+        ("../", "http://a/b/"), ("../g", "http://a/b/g"), ("../..", "http://a/"), ("../../", "http://a/"),
+        ("../../g", "http://a/g"), ("../../../g", "http://a/g"), ("../../../../g", "http://a/g"),
+        ("/./g", "http://a/g"), ("/../g", "http://a/g"), ("g.", "http://a/b/c/g."), (".g", "http://a/b/c/.g"),
+        ("g..", "http://a/b/c/g.."), ("..g", "http://a/b/c/..g"), ("./../g", "http://a/b/g"),
+        ("./g/.", "http://a/b/c/g/"), ("g/./h", "http://a/b/c/g/h"), ("g/../h", "http://a/b/c/h"),
+        ("g;x=1/./y", "http://a/b/c/g;x=1/y"), ("g;x=1/../y", "http://a/b/c/y"), ("g?y/./x", "http://a/b/c/g?y/./x"),
+        ("g?y/../x", "http://a/b/c/g?y/../x"), ("g#s/./x", "http://a/b/c/g#s/./x"),
+        ("g#s/../x", "http://a/b/c/g#s/../x"), ("http:g", "http:g"),
+    ];
+    for (r, want) in cases {
+        let got = f"{try! base.join(r)}";
+        expect(got == want, f"{r:?} -> {got:?}, want {want:?}");
+    }
+}
+
+#[test]
+fn uri_normalize() {
+    let n = uri("HTTP://Example.COM:80/a/./b/../c/%7euser%2f?Q=%3a").normalize();
+    expect(f"{n}" == "http://example.com/a/c/~user%2F?Q=%3A", f"{n}");
+    expect(f"{uri("https://h:443").normalize()}" == "https://h/", "default port, empty path");
+}
+
+#[test]
+fn percent_and_form() {
+    expect(percent_encode("a b/ü") == "a%20b%2F%C3%BC", "encode");
+    expect(percent_encode("a b/c", "/") == "a%20b/c", "keep");
+    expect(try! percent_decode("a%20b%2F%C3%BC") == "a b/ü", "decode");
+    expect((try? percent_decode("%4")) is none && (try? percent_decode("%ff")) is none, "bad decode");
+    expect(form_encode([("a b", "x&y=z"), ("k", "ü*")]) == "a+b=x%26y%3Dz&k=%C3%BC*", "form encode");
+    let d = form_decode("a+b=x%26y%3Dz&&k=%C3%BC&flag&bad=%zz&lone=%");
+    expect(d.len() == 5 && d[0] == ("a b", "x&y=z") && d[1] == ("k", "ü") && d[2] == ("flag", ""), "form decode");
+    expect(d[3] == ("bad", "%zz") && d[4] == ("lone", "%"), "lenient");
+    expect(form_decode("x=%FF")[0] == ("x", "\u{FFFD}"), "lossy");
+    expect(uri("/s?q=a+b&n=1").query_pairs()[0] == ("q", "a b"), "query pairs");
+}
+
+#[test]
+fn headers_multimap() {
+    let h = HeaderMap::new();
+    h.append("Content-Type", "text/plain");
+    h.append("Set-Cookie", "a=1");
+    h.append("set-cookie", "b=2");
+    expect(h.get("content-type") == "text/plain" && h.get("CONTENT-TYPE") == "text/plain", "case");
+    expect(h.get_all("Set-Cookie").len() == 2 && h.len() == 3, "multi");
+    h.insert("SET-COOKIE", "c=3");
+    expect(h.get_all("set-cookie") == ["c=3"] && h.len() == 2, "insert replaces");
+    expect(h.remove("content-type") && !h.contains("content-type"), "remove");
+    h.append("Connection", "keep-alive, Upgrade");
+    expect(h.has_token("connection", "upgrade") && !h.has_token("connection", "close"), "tokens");
+    h.append("x", "a\r\nInjected: 1");
+    expect(fails(|| try h.validate()), "injection rejected");
+    let bad = HeaderMap::new();
+    bad.append("bad name", "v");
+    expect(fails(|| try bad.validate()), "name rejected");
+}
+
+#[test]
+fn method_and_status() {
+    expect((try! Method::parse("PROPFIND")).as_str() == "PROPFIND", "ext");
+    expect((try? Method::parse("GE T")) is none, "bad method");
+    expect(Method::PUT.is_idempotent() && !Method::POST.is_idempotent() && Method::HEAD.is_safe(), "props");
+    expect(StatusCode::NOT_FOUND.reason() == "Not Found" && StatusCode::NOT_FOUND.is_client_error(), "status");
+    expect((try? StatusCode::new(42u16)) is none, "bad status");
+}
+
+#[test]
+fn cookies() {
+    let c = parse_cookie_header("a=1; b=\"two\";c=x=y; ;d");
+    expect(c.len() == 3 && c[1] == ("b", "two") && c[2] == ("c", "x=y"), f"{c:?}");
+    let s = SetCookie::parse("id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=60; Domain=.Example.com; Path=/docs; Secure; HttpOnly; SameSite=lax") ?? panic("none");
+    expect(s.name == "id" && s.value == "a3fWa" && s.max_age == 60i64 && s.domain == "example.com", "attrs");
+    expect(s.path == "/docs" && s.secure && s.http_only && s.same_site == "Lax", "flags");
+    expect(s.expires == "Wed, 21 Oct 2015 07:28:00 GMT", "expires");
+    expect(try! s.to_header() == "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=60; Domain=example.com; Path=/docs; Secure; HttpOnly; SameSite=Lax", "serialize");
+    expect(SetCookie::parse("novalue") is none && SetCookie::parse("=x") is none, "invalid");
+    expect((try? SetCookie { name: "a", value: "b;c" }.to_header()) is none, "bad value");
+    expect((try? cookie_header([("a b", "1")])) is none && try! cookie_header([("a", "1"), ("b", "2")]) == "a=1; b=2", "header");
+}
+
+#[test]
+fn bodies() {
+    task::block_on(async {
+        let b = Body::from_str("hello");
+        expect(b.len() == 5u64 && (try! await b.text()) == "hello", "full");
+        expect((try! await b.chunk()) is none, "read once");
+        let (w, s) = Body::channel(2);
+        let t = task::spawn(async {
+            try! await w.send_str("ab");
+            try! await w.send_str("cd");
+            w.finish();
+            0
+        });
+        expect((try! await s.text()) == "abcd", "streamed");
+        await t;
+        let (w2, s2) = Body::channel();
+        let t2 = task::spawn(async {
+            await w2.fail(HttpError::new(ErrorKind::Closed, "gone"));
+            0
+        });
+        expect((try? await s2.bytes()) is none, "error delivered");
+        await t2;
+        expect((try? await Body::from_str("toolong").bytes(3)) is none, "limit");
+    });
+}

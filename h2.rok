@@ -1,0 +1,23 @@
+// HTTP/2 (RFC 9113).
+
+use pkg::conn::Io;
+use pkg::server::Handler;
+
+#[derive(Clone)]
+pub struct Config {
+    pub max_concurrent_streams: u32 = 100u32;
+}
+
+pub(pkg) async fn serve_conn(io: Io, handler: Handler, cfg: Config, drain: Receiver<i32>) {}
+
+pub(pkg) struct ClientConn {
+    io: Io;
+}
+
+impl ClientConn {
+    pub async fn start(io: Io, cfg: Config, deadline: Instant | none) throws (pkg::error::HttpError) -> ClientConn { ClientConn { io: io } }
+    pub fn usable(self) -> bool { false }
+    pub async fn send(self, req: pkg::message::Request, deadline: Instant | none) throws (pkg::error::HttpError) -> pkg::message::Response {
+        throw pkg::error::HttpError::new(pkg::error::ErrorKind::Unsupported, "todo");
+    }
+}

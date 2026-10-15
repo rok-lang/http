@@ -9,6 +9,11 @@ pub mod uri;
 pub mod cookie;
 pub mod body;
 pub mod message;
+mod conn;
+pub mod h1;
+pub mod h2;
+pub mod server;
+pub mod client;
 
 #[cfg(test)]
 mod tests;
@@ -21,3 +26,5 @@ pub use uri::{Uri, percent_encode, percent_decode, percent_decode_bytes, form_en
 pub use cookie::{SetCookie, parse_cookie_header, cookie_header};
 pub use body::{Body, BodyWriter};
 pub use message::{Request, Response, Version};
+pub use server::{Server, ServerConfig, Handler, serve};
+pub use client::{Client, ClientConfig, get};

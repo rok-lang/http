@@ -1,0 +1,175 @@
+// A buffered TCP connection with deadlines, shared by HTTP/1.1 and
+// HTTP/2.
+
+use rok::std::net::{TcpStream, Shutdown};
+use rok::std::io::{IoError, IoErrorKind, byte_buf};
+use pkg::error::{HttpError, ErrorKind};
+
+/// Read granularity.
+const READ_CHUNK: usize = 16384;
+
+struct Buf {
+    data: List<u8>;
+    /// Start of the unread bytes in `data`.
+    at: usize;
+}
+
+/// A socket plus the bytes read from it and not consumed yet. Copies
+/// share both.
+pub(pkg) struct Io {
+    pub s: TcpStream;
+    st: List<Buf>;
+}
+
+pub(pkg) fn io_err(e: IoError) -> HttpError {
+    if e.kind == IoErrorKind::TimedOut { return HttpError::new(ErrorKind::Timeout, e.message); }
+    HttpError::new(ErrorKind::Io, e.message)
+}
+
+pub(pkg) fn timed_out(what: str) -> HttpError { HttpError::new(ErrorKind::Timeout, f"{what}: timed out") }
+
+/// What is left of `deadline`, at least zero.
+pub(pkg) fn left(deadline: Instant) -> Duration { deadline.saturating_duration_since(Instant::now()) }
+
+/// `now + d`, or `none`.
+pub(pkg) fn deadline_in(d: Duration | none) -> Instant | none {
+    match d {
+        x: Duration => Instant::now().checked_add(x),
+        none => none,
+    }
+}
+
+/// The earlier of two deadlines.
+pub(pkg) fn earlier(a: Instant | none, b: Instant | none) -> Instant | none {
+    match a {
+        x: Instant => match b {
+            y: Instant => if y < x { y } else { x },
+            none => x,
+        },
+        none => b,
+    }
+}
+
+/// Connect to `host:port` before `deadline`.
+pub(pkg) async fn connect(host: str, port: u16, deadline: Instant | none) throws (HttpError) -> Io {
+    let target = if host.contains(":") { f"[{host}]:{port}" } else { f"{host}:{port}" };
+    let r = await within(connect_res(target), deadline, f"connect {target}");
+    let s = match r {
+        Result::Ok(s) => s,
+        Result::Err(e) => throw io_err(e),
+    };
+    try? s.set_nodelay(true);
+    Io::new(s)
+}
+
+impl Io {
+    pub fn new(s: TcpStream) -> Io { Io { s: s, st: [Buf { data: List::new(), at: 0usize }] } }
+
+    /// Number of unread bytes.
+    pub fn buffered(self) -> usize { self.st[0].data.len() - self.st[0].at }
+
+    /// The unread bytes (a view; valid until the next `fill`).
+    pub fn peek(self) -> Slice<u8> {
+        let b = self.st[0];
+        b.data[b.at:b.data.len()]
+    }
+
+    /// Mark `n` unread bytes read.
+    pub fn consume(self, n: usize) { self.st[0].at = self.st[0].at + n; }
+
+    /// The next `n` unread bytes (there must be that many).
+    pub fn take(self, n: usize) -> List<u8> {
+        let b = self.st[0];
+        let out = b.data[b.at:b.at + n].to_list();
+        self.st[0].at = b.at + n;
+        out
+    }
+
+    /// Read more from the socket; `false` at end of stream.
+    pub async fn fill(self, deadline: Instant | none) throws (HttpError) -> bool {
+        let scratch = byte_buf(READ_CHUNK);
+        let n = try await read_some(self.s, scratch, deadline);
+        if n == 0 { return false; }
+        let b = self.st[0];
+        if b.at == b.data.len() {
+            self.st[0] = Buf { data: scratch[0:n].to_list(), at: 0usize };
+        } else if b.at > 0 && b.at * 2 >= b.data.len() {
+            let rest = b.data[b.at:b.data.len()].to_list();
+            rest.extend(scratch[0:n]);
+            self.st[0] = Buf { data: rest, at: 0usize };
+        } else {
+            b.data.extend(scratch[0:n]);
+        }
+        true
+    }
+
+    /// Fill until `n` bytes are unread; throws `Closed` at end of stream.
+    pub async fn need(self, n: usize, deadline: Instant | none) throws (HttpError) {
+        while self.buffered() < n {
+            if !(try await self.fill(deadline)) { throw HttpError::new(ErrorKind::Closed, "connection closed mid-message"); }
+        }
+    }
+
+    pub async fn write(self, data: Slice<u8>, deadline: Instant | none) throws (HttpError) {
+        let r = await within(write_res(self.s, data), deadline, "write");
+        if let Result::Err(e) = r { throw io_err(e); }
+    }
+
+    pub fn close(self) {
+        try? self.s.shutdown(Shutdown::Both);
+        self.s.close();
+    }
+}
+
+async fn read_some(s: TcpStream, buf: List<u8>, deadline: Instant | none) throws (HttpError) -> usize {
+    let r = await within(read_res(s, buf), deadline, "read");
+    match r {
+        Result::Ok(n) => n,
+        Result::Err(e) => throw io_err(e),
+    }
+}
+
+async fn connect_res(target: str) -> Result<TcpStream, IoError> {
+    try Result::Ok(await rok::std::net::tcp_connect_async(target)) catch e: IoError { Result::Err(e) }
+}
+
+async fn read_res(s: TcpStream, buf: List<u8>) -> Result<usize, IoError> {
+    try Result::Ok(await s.read_async(buf)) catch e: IoError { Result::Err(e) }
+}
+
+async fn write_res(s: TcpStream, data: Slice<u8>) -> Result<usize, IoError> {
+    try {
+        await s.write_all_async(data);
+        Result::Ok(data.len())
+    } catch e: IoError { Result::Err(e) }
+}
+
+async fn expire<T>(d: Duration, what: str) -> Result<T, IoError> {
+    await task::sleep(d);
+    Result::Err(IoError::with_kind(IoErrorKind::TimedOut, f"{what}: timed out"))
+}
+
+/// `f`'s result, or a `TimedOut` error at `deadline` (`f` is then
+/// cancelled).
+async fn within<T>(f: AsyncFuture<Result<T, IoError>>, deadline: Instant | none, what: str) -> Result<T, IoError> {
+    match deadline {
+        none => await f,
+        d: Instant => {
+            let (_, x) = await task::select([f, expire::<T>(left(d), what)]);
+            x
+        },
+    }
+}
+
+/// Move `v` into a new task running `f(v)`: a spawned future may not
+/// capture a collection the spawner keeps, so `v` crosses a channel.
+pub(pkg) fn spawn_with<T: Send, U: Send>(v: T, f: fn(T) -> AsyncFuture<U> + Send) -> Task<U> {
+    let (tx, rx) = channel::<T>();
+    try! tx.send(v);
+    task::spawn(async {
+        match await rx.recv_async() {
+            x: T => await f(x),
+            none => panic("spawn_with: value lost"),
+        }
+    })
+}

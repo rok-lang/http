@@ -1,0 +1,409 @@
+// The server: an accept loop, a task per connection, HTTP/1.1 with
+// keep-alive and pipelining, HTTP/2 by prior knowledge (h2c), graceful
+// shutdown.
+
+use rok::std::net::{TcpListener, TcpStream, SocketAddr, Shutdown};
+use rok::std::io::IoError;
+use pkg::body::{Body, Chunk};
+use pkg::conn::{Io, io_err, deadline_in, spawn_with};
+use pkg::error::{HttpError, ErrorKind};
+use pkg::h1;
+use pkg::h1::{Limits, Framing, Pumped, PumpOpts, DONE};
+use pkg::h2;
+use pkg::headers::HeaderMap;
+use pkg::message::{Request, Response, Version};
+use pkg::method::Method;
+use pkg::status::StatusCode;
+use pkg::uri::Uri;
+
+/// The request handler: one call per request, each in its own task.
+pub type Handler = fn(Request) -> AsyncFuture<Response> + Send;
+
+/// Server settings. Every field has a default.
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub limits: Limits = Limits {};
+    /// Time to receive a request head once its first byte arrived.
+    pub header_timeout: Duration | none = Duration::sec(30);
+    /// Time a keep-alive connection may wait for its next request.
+    pub idle_timeout: Duration | none = Duration::sec(60);
+    /// Longest wait for one read of a request body / one write.
+    pub io_timeout: Duration | none = Duration::sec(60);
+    /// Larger request bodies fail with `TooLarge` (the connection then
+    /// closes).
+    pub max_body: u64 | none = none;
+    /// Accept HTTP/2 with prior knowledge on plaintext connections.
+    pub http2: bool = true;
+    /// HTTP/2 settings.
+    pub h2: h2::Config = h2::Config {};
+}
+
+struct ConnEntry {
+    s: TcpStream;
+    /// Waiting for a request (HTTP/1.1): closed at once on shutdown.
+    idle: bool;
+    /// Draining notice for an HTTP/2 connection.
+    drain: Sender<i32> | none;
+}
+
+/// A bound server. Copies share it.
+pub struct Server {
+    l: TcpListener;
+    handler: Handler;
+    cfg: ServerConfig;
+    stopping: Atomic<bool>;
+    ids: Atomic<u64>;
+    conns: Mutex<Dict<u64, ConnEntry>>;
+    stop_tx: Sender<i32>;
+    stop_rx: Receiver<i32>;
+}
+
+/// Serve `handler` on `addr` (`"127.0.0.1:8080"`) until the process
+/// ends.
+pub async fn serve(addr: str, handler: Handler) throws (HttpError) {
+    let s = try Server::bind(addr, handler);
+    try await s.run();
+}
+
+enum Accepted {
+    Conn(TcpStream),
+    Stop,
+    Failed(IoError),
+}
+
+async fn accept_one(l: TcpListener) -> Accepted {
+    try {
+        let (s, _) = await l.accept_async();
+        Accepted::Conn(s)
+    } catch e: IoError { Accepted::Failed(e) }
+}
+
+async fn stop_signal(rx: Receiver<i32>) -> Accepted {
+    await rx.recv_async();
+    Accepted::Stop
+}
+
+impl Server {
+    pub fn bind(addr: str, handler: Handler, cfg: ServerConfig | none = none) throws (HttpError) -> Server {
+        let l = try rok::std::net::tcp_listen(addr) catch e: IoError { throw io_err(e); };
+        let (tx, rx) = channel::<i32>();
+        Server {
+            l: l,
+            handler: handler,
+            cfg: cfg ?? ServerConfig {},
+            stopping: Atomic::new(false),
+            ids: Atomic::new(0u64),
+            conns: Mutex::new(Dict::new()),
+            stop_tx: tx,
+            stop_rx: rx,
+        }
+    }
+
+    pub fn local_addr(self) throws (HttpError) -> SocketAddr {
+        try self.l.local_addr() catch e: IoError { throw io_err(e); }
+    }
+
+    /// Accept connections until `shutdown`.
+    pub async fn run(self) throws (HttpError) {
+        let failures = 0;
+        while !self.stopping.load() {
+            let (_, a) = await task::select([accept_one(self.l), stop_signal(self.stop_rx)]);
+            match a {
+                Accepted::Conn(s) => {
+                    failures = 0;
+                    try? s.set_nodelay(true);
+                    let me = self;
+                    task::spawn(async {
+                        await me.conn_main(s);
+                        0
+                    });
+                },
+                Accepted::Stop => break,
+                Accepted::Failed(e) => {
+                    // Out of descriptors and the like: back off, keep going.
+                    failures += 1;
+                    if failures > 100 { throw io_err(e); }
+                    await task::sleep(Duration::ms(10));
+                },
+            }
+        }
+        self.l.close();
+    }
+
+    /// Stop accepting, close idle connections, tell HTTP/2 connections
+    /// to finish (GOAWAY), and wait for in-flight requests; after
+    /// `grace` the remaining connections are cut.
+    pub async fn shutdown(self, grace: Duration | none = Duration::sec(30)) {
+        if self.stopping.swap(true) { return; }
+        try? self.stop_tx.send(1);
+        using g = self.conns.lock() {
+            for e in g.get().values() {
+                if e.idle { try? e.s.shutdown(Shutdown::Both); }
+                if let d: Sender<i32> = e.drain { try? d.send(1); }
+            }
+        }
+        let end = deadline_in(grace);
+        loop {
+            let n = 0usize;
+            using g = self.conns.lock() { n = g.get().len(); }
+            if n == 0 { break; }
+            if let t: Instant = end {
+                if Instant::now() >= t {
+                    using g = self.conns.lock() {
+                        for e in g.get().values() { try? e.s.shutdown(Shutdown::Both); }
+                    }
+                    break;
+                }
+            }
+            // Polls: connections finish on their own schedule.
+            await task::sleep(Duration::ms(10));
+        }
+    }
+
+    fn set_entry(self, id: u64, e: ConnEntry) {
+        using g = self.conns.lock() { g.get().insert(id, e); }
+    }
+
+    /// Mark connection `id` idle (`true`) or busy; `false` if the server
+    /// is stopping (then the connection should end).
+    fn mark(self, id: u64, idle: bool) -> bool {
+        using g = self.conns.lock() {
+            let d = g.get();
+            if let e: ConnEntry = d.get(id) {
+                e.idle = idle;
+                d.insert(id, e);
+            }
+        }
+        !self.stopping.load()
+    }
+
+    async fn conn_main(self, s: TcpStream) {
+        let id = self.ids.fetch_add(1u64);
+        self.set_entry(id, ConnEntry { s: s, idle: true, drain: none });
+        let io = Io::new(s);
+        if !self.stopping.load() {
+            let is_h2 = false;
+            if self.cfg.http2 {
+                is_h2 = try await sniff_preface(io, deadline_in(self.cfg.header_timeout)) catch _ { false };
+            }
+            if is_h2 {
+                let (dtx, drx) = channel::<i32>();
+                self.set_entry(id, ConnEntry { s: s, idle: false, drain: dtx });
+                await h2::serve_conn(io, self.handler, self.cfg.h2, drx);
+            } else {
+                await self.serve_h1(io, id);
+            }
+        }
+        io.close();
+        using g = self.conns.lock() { g.get().remove(id); }
+    }
+
+    async fn serve_h1(self, io: Io, id: u64) {
+        let cfg = self.cfg;
+        loop {
+            if !self.mark(id, true) { break; }
+            let first = deadline_in(cfg.idle_timeout);
+            let block = try await h1::read_block(io, cfg.limits.max_head, first, deadline_in(cfg.header_timeout)) catch e: HttpError {
+                if e.code > 0u32 { try? await write_error(io, e, cfg); }
+                break;
+            };
+            let b = match block {
+                x: List<u8> => x,
+                none => break,
+            };
+            self.mark(id, false);
+            let keep = try await self.exchange(io, b) catch e: HttpError {
+                if e.code > 0u32 { try? await write_error(io, e, cfg); }
+                false
+            };
+            if !keep { break; }
+        }
+    }
+
+    /// One request / response; whether the connection stays open.
+    async fn exchange(self, io: Io, block: List<u8>) throws (HttpError) -> bool {
+        let cfg = self.cfg;
+        let head = try h1::parse_request_head(block, cfg.limits);
+        let fr = try h1::request_framing(head);
+        let uri = try request_uri(head);
+        let cont: str | none = none;
+        for e in head.headers.get_all("expect") {
+            if e.to_lowercase() != "100-continue" { throw h1::bad(417u16, f"unsupported expectation {e:?}"); }
+            if head.version == Version::Http11 { cont = "HTTP/1.1 100 Continue\r\n\r\n"; }
+        }
+        let keep = if head.version == Version::Http11 {
+            !head.headers.has_token("connection", "close")
+        } else {
+            head.headers.has_token("connection", "keep-alive")
+        };
+        let len: u64 | none = match fr {
+            Framing::Length(n) => n,
+            Framing::Empty => 0u64,
+            _ => none,
+        };
+        let (tx, rx) = channel::<Chunk>();
+        let (ctx, crx) = channel::<(u32, usize)>();
+        let req = Request { method: head.method, uri: uri, version: head.version, headers: head.headers, body: Body::pulled(rx, ctx, 1u32, len) };
+        let (rtx, rrx) = channel::<Response>();
+        let h = self.handler;
+        spawn_with(req, async |r: Request| {
+            let resp = await h(r);
+            try? rtx.send(resp);
+            try? ctx.send((DONE, 0usize));
+            0
+        });
+        let pumped = await h1::pump(io, fr, tx, crx, PumpOpts { cont: cont, read_timeout: cfg.io_timeout, max: cfg.max_body });
+        if pumped != Pumped::Abandoned {
+            loop {
+                match await crx.recv_async() {
+                    m: (u32, usize) => if m.0 == DONE { break; },
+                    none => break,
+                }
+            }
+        }
+        let resp = match await rrx.recv_async() {
+            r: Response => r,
+            none => Response::new(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        let k = keep && pumped == Pumped::Complete && !self.stopping.load();
+        try await write_response(io, resp, head.method, head.version, k, cfg.io_timeout)
+    }
+}
+
+const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Whether the connection starts with the HTTP/2 client preface (read
+/// only as far as needed to tell).
+async fn sniff_preface(io: Io, deadline: Instant | none) throws (HttpError) -> bool {
+    let p = PREFACE.as_bytes();
+    loop {
+        let got = io.peek();
+        let n = if got.len() < p.len() { got.len() } else { p.len() };
+        for i in 0..n {
+            if got[i] != p[i] { return false; }
+        }
+        if n == p.len() { return true; }
+        if !(try await io.fill(deadline)) { return false; }
+    }
+}
+
+/// The request's URI from its target (RFC 9112 3.2) and `Host`.
+fn request_uri(head: h1::ReqHead) throws (HttpError) -> Uri {
+    let hosts = head.headers.get_all("host");
+    if hosts.len() > 1 || head.version == Version::Http11 && hosts.is_empty() { throw h1::bad(400u16, "missing or repeated Host"); }
+    let t = head.target;
+    let u = if t.starts_with("/") {
+        try Uri::parse(t) catch _ { throw h1::bad(400u16, f"invalid request target {t:?}"); }
+    } else if t == "*" {
+        if head.method != Method::OPTIONS { throw h1::bad(400u16, "asterisk-form outside OPTIONS"); }
+        Uri { path: "*" }
+    } else if head.method == Method::CONNECT {
+        try Uri::parse("//" + t) catch _ { throw h1::bad(400u16, f"invalid authority {t:?}"); }
+    } else {
+        let a = try Uri::parse(t) catch _ { throw h1::bad(400u16, f"invalid request target {t:?}"); };
+        if !a.is_absolute() || a.host is none { throw h1::bad(400u16, f"invalid request target {t:?}"); }
+        a
+    };
+    if u.fragment is str { throw h1::bad(400u16, "fragment in request target"); }
+    if u.host is none {
+        if let h: str = hosts.first() {
+            if !h.is_empty() {
+                let a = try Uri::parse("//" + h) catch _ { throw h1::bad(400u16, f"invalid Host {h:?}"); };
+                if !a.path.is_empty() || a.query is str || a.userinfo is str { throw h1::bad(400u16, f"invalid Host {h:?}"); }
+                u.host = a.host;
+                u.port = a.port;
+            }
+        }
+    }
+    if u.scheme.is_empty() { u.scheme = "http"; }
+    u
+}
+
+/// Answer a request that could not be parsed, then close.
+async fn write_error(io: Io, e: HttpError, cfg: ServerConfig) throws (HttpError) {
+    let st = try StatusCode::new(e.code as u16) catch _ { StatusCode::BAD_REQUEST };
+    let msg = e.message + "\n";
+    let head = f"HTTP/1.1 {st} {st.reason()}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {msg.len()}\r\nconnection: close\r\ndate: {h1::date_now()}\r\n\r\n";
+    try await io.write((head + msg).as_bytes(), deadline_in(cfg.io_timeout));
+}
+
+/// Write `resp`; whether the connection may stay open.
+pub(pkg) async fn write_response(io: Io, resp: Response, method: Method, version: Version, keep: bool, timeout: Duration | none) throws (HttpError) -> bool {
+    let h = resp.headers;
+    let resp_ok = true;
+    try h.validate() catch _ { resp_ok = false; };
+    if !resp_ok {
+        resp = Response::new(StatusCode::INTERNAL_SERVER_ERROR);
+        h = resp.headers;
+    }
+    let code = resp.status.as_u16();
+    let no_body = code < 200u16 || code == 204u16 || code == 304u16;
+    if h.has_token("connection", "close") { keep = false; }
+    let out = StrBuf::new();
+    out.push_str(f"HTTP/1.1 {code} {resp.status.reason()}\r\n");
+    if !h.contains("date") { out.push_str(f"date: {h1::date_now()}\r\n"); }
+    // Fields the writer owns.
+    let skip: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"];
+    let user_len = h.get("content-length");
+    h1::push_fields(out, h, skip);
+    let body = resp.body;
+    let send_body = !no_body && method != Method::HEAD;
+    let chunked = false;
+    match body.len() {
+        n: u64 => if !no_body {
+            let shown = f"{n}";
+            if method == Method::HEAD && n == 0u64 {
+                if let ul: str = user_len { shown = ul; }
+            }
+            out.push_str(f"content-length: {shown}\r\n");
+        },
+        none => if send_body {
+            if version == Version::Http11 {
+                out.push_str("transfer-encoding: chunked\r\n");
+                chunked = true;
+            } else {
+                keep = false;
+            }
+        },
+    }
+    if !keep {
+        out.push_str("connection: close\r\n");
+    } else if version == Version::Http10 {
+        out.push_str("connection: keep-alive\r\n");
+    }
+    out.push_str("\r\n");
+    let head = out.to_str();
+    let dl = deadline_in(timeout);
+    if !send_body || body.is_empty() {
+        try await io.write(head.as_bytes(), dl);
+        return keep;
+    }
+    if let full: List<u8> = body.replayable() {
+        try await io.write(h1::concat(head, full)[0:head.len() + full.len()], dl);
+        return keep;
+    }
+    try await io.write(head.as_bytes(), dl);
+    let sent = 0u64;
+    loop {
+        let c = try await body.chunk() catch _ { return false; };
+        match c {
+            b: List<u8> => {
+                sent += b.len() as u64;
+                if chunked {
+                    let framed = h1::concat(f"{b.len():x}\r\n", b);
+                    framed.push(0x0Du8);
+                    framed.push(0x0Au8);
+                    try await io.write(framed[0:framed.len()], deadline_in(timeout));
+                } else {
+                    try await io.write(b[0:b.len()], deadline_in(timeout));
+                }
+            },
+            none => break,
+        }
+    }
+    if chunked { try await io.write("0\r\n\r\n".as_bytes(), deadline_in(timeout)); }
+    if let n: u64 = body.len() {
+        if sent != n { return false; }
+    }
+    keep
+}

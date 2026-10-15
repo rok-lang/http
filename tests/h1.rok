@@ -1,0 +1,273 @@
+// HTTP/1.1: head parsing, smuggling cases, loopback client and server.
+
+use rok::std::net::{TcpStream, Shutdown};
+use rok::std::io::IoError;
+use pkg::*;
+use pkg::h1::{Limits, Framing, parse_request_head, parse_response_head, request_framing, response_framing};
+use sup::expect;
+
+fn bytes(s: str) -> List<u8> { s.as_bytes().to_list() }
+
+fn req_status(s: str) -> u32 {
+    try {
+        let h = parse_request_head(bytes(s), Limits {});
+        request_framing(h);
+        0u32
+    } catch e: HttpError { e.code }
+}
+
+#[test]
+fn parse_request() {
+    let h = try! parse_request_head(bytes("POST /a?b HTTP/1.1\r\nHost: x\r\nX-A:  v 1 \t\r\nx-a: 2\r\nContent-Length: 5\r\n\r\n"), Limits {});
+    expect(h.method == Method::POST && h.target == "/a?b" && h.version == Version::Http11, "line");
+    expect(h.headers.get_all("x-a") == ["v 1", "2"], "fields, OWS trimmed");
+    expect(try! request_framing(h) == Framing::Length(5u64), "length");
+    let c = try! parse_request_head(bytes("PUT / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n"), Limits {});
+    expect(try! request_framing(c) == Framing::Chunked, "chunked");
+}
+
+#[test]
+fn smuggling_and_malformed_heads() {
+    let cases = [
+        // (head, status to answer)
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3, 3\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: +3\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0x3\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", 501u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: xchunked\r\n\r\n", 400u32),
+        ("GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding : chunked\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\n Transfer-Encoding: chunked\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nX: a\r\n b\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\rX: y\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\nX: y\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nX: a\u{0}b\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nHost: x\r\nX: a\u{1}b\r\n\r\n", 400u32),
+        ("GET  / HTTP/1.1\r\nHost: x\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1 \r\nHost: x\r\n\r\n", 400u32),
+        ("GET /a b HTTP/1.1\r\nHost: x\r\n\r\n", 400u32),
+        ("G\"T / HTTP/1.1\r\nHost: x\r\n\r\n", 400u32),
+        ("GET / HTTP/2.0\r\nHost: x\r\n\r\n", 505u32),
+        ("GET / http/1.1\r\nHost: x\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\n: x\r\n\r\n", 400u32),
+        ("GET / HTTP/1.1\r\nno colon\r\n\r\n", 400u32),
+    ];
+    for (head, want) in cases {
+        let got = req_status(head);
+        expect(got == want, f"{head:?}: got {got}, want {want}");
+    }
+    let many = StrBuf::new();
+    many.push_str("GET / HTTP/1.1\r\n");
+    for i in 0..101 { many.push_str(f"x{i}: y\r\n"); }
+    many.push_str("\r\n");
+    expect(req_status(many.to_str()) == 431u32, "too many fields");
+    let long = "GET /" + "a".repeat(9000) + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    expect(req_status(long) == 414u32, "target too long");
+}
+
+#[test]
+fn parse_response() {
+    let h = try! parse_response_head(bytes("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"), Limits {});
+    expect(h.status == 404u16 && try! response_framing(Method::GET, h) == Framing::Empty, "404");
+    let c = try! parse_response_head(bytes("HTTP/1.0 200\r\n\r\n"), Limits {});
+    expect(c.version == Version::Http10 && try! response_framing(Method::GET, c) == Framing::Close, "close-delimited");
+    expect(try! response_framing(Method::HEAD, try! parse_response_head(bytes("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n"), Limits {})) == Framing::Empty, "HEAD");
+    for bad in ["HTTP/1.1 2000 OK\r\n\r\n", "HTTP/1.1 20 OK\r\n\r\n", "HTTP/1.1 099 x\r\n\r\n", "HTTP/1.1 200 OK\r\nA: b\r\n c\r\n\r\n"] {
+        expect((try? parse_response_head(bytes(bad), Limits {})) is none, f"reject {bad:?}");
+    }
+    expect(h1::http_date(784111777i64) == "Sun, 06 Nov 1994 08:49:37 GMT", "date");
+    expect(h1::http_date(951782400i64) == "Tue, 29 Feb 2000 00:00:00 GMT", "leap day");
+}
+
+// ---- loopback ----
+
+pub(pkg) async fn test_handler(req: Request) -> Response {
+    let p = req.uri.path;
+    if p == "/echo" {
+        let b = try await req.body.bytes() catch e: HttpError {
+            return Response::new(StatusCode::BAD_REQUEST).with_body(Body::from_str(f"body error: {e}"));
+        };
+        return Response::bytes(b).header("x-method", f"{req.method}");
+    }
+    if p == "/stream" {
+        let (w, body) = Body::channel();
+        task::spawn(async {
+            for i in 0..50 { try? await w.send_str(f"line {i}\n"); }
+            w.finish();
+            0
+        });
+        return Response::new(StatusCode::OK).with_body(body);
+    }
+    if p == "/slow" {
+        await task::sleep(Duration::ms(500));
+        return Response::text("slow");
+    }
+    if p == "/redirect" { return Response::new(StatusCode::FOUND).header("location", "/final?from=r"); }
+    if p == "/see-other" { return Response::new(StatusCode::SEE_OTHER).header("location", "/echo"); }
+    if p == "/loop" { return Response::new(StatusCode::FOUND).header("location", "/loop"); }
+    if p == "/big" {
+        let b: List<u8> = List::with_capacity(200000);
+        for i in 0..200000 { b.push((i % 251) as u8); }
+        return Response::bytes(b);
+    }
+    if p == "/ignore-body" { return Response::text("ignored"); }
+    Response::text(f"{req.method} {req.uri.path_and_query()} {req.version} host={req.uri.authority()}")
+}
+
+/// A running server on a free port and its base URL.
+pub(pkg) fn start(cfg: ServerConfig | none = none) -> (Server, str) {
+    let s = try! Server::bind("127.0.0.1:0", test_handler, cfg);
+    let a = try! s.local_addr();
+    task::spawn(async {
+        try! await s.run();
+        0
+    });
+    (s, f"http://{a}")
+}
+
+/// Send `data` on a fresh connection, half-close, read everything back.
+pub(pkg) async fn raw(base: str, data: str) -> str {
+    let s = try! await rok::std::net::tcp_connect_async(base.strip_prefix("http://") ?? base);
+    try! await s.write_all_async(data);
+    try! s.shutdown(Shutdown::Write);
+    let back = try! await s.read_to_end_async();
+    s.close();
+    try! str::from_utf8(back)
+}
+
+/// The kind of error `GET url` ends with, `none` on success.
+pub(pkg) async fn err_kind(c: Client, url: str) -> ErrorKind | none {
+    try {
+        await c.get(url);
+        none
+    } catch e: HttpError { e.kind }
+}
+
+#[test]
+fn loopback_basic() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let c = Client::new();
+        let r = try! await c.get(base + "/hi?x=1");
+        expect(r.status == StatusCode::OK && r.version == Version::Http11, "status");
+        let t = try! await r.body.text();
+        expect(t.starts_with("GET /hi?x=1 HTTP/1.1 host=127.0.0.1:"), t);
+        expect(r.headers.get("date") is str && r.headers.get("content-length") == f"{t.len()}", "headers");
+        // The connection went back to the pool and is reused.
+        let r2 = try! await c.send(try! Request::post(base + "/echo").text("ping"));
+        expect((try! await r2.body.text()) == "ping" && r2.headers.get("x-method") == "POST", "echo");
+        expect(c.idle_count(base) == 1usize, "pooled");
+        let s = try! await c.get(base + "/stream");
+        expect(s.headers.get("transfer-encoding") == "chunked", "chunked response");
+        let st = try! await s.body.text();
+        expect(st.lines().count() == 50 && st.ends_with("line 49\n"), "stream");
+        let big = try! await c.get(base + "/big");
+        let bb = try! await big.body.bytes();
+        expect(bb.len() == 200000 && bb[199999] == (199999 % 251) as u8, "big");
+        let h = try! await c.send(try! Request::head(base + "/big"));
+        expect(h.headers.get("content-length") == "200000" && (try! await h.body.bytes()).is_empty(), "HEAD");
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn loopback_streaming_upload() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let (w, body) = Body::channel();
+        task::spawn(async {
+            for i in 0..100 { try! await w.send_str(f"{i},"); }
+            w.finish();
+            0
+        });
+        let r = try! await Client::new().send((try! Request::post(base + "/echo")).with_body(body));
+        let t = try! await r.body.text();
+        expect(t.starts_with("0,1,2,") && t.ends_with("98,99,"), "chunked upload");
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn redirects_and_timeouts() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let c = Client::new();
+        let r = try! await c.get(base + "/redirect");
+        expect((try! await r.body.text()).starts_with("GET /final?from=r "), "followed");
+        let so = try! await c.send((try! Request::post(base + "/see-other")).text("data"));
+        expect((try! await so.body.text()).is_empty(), "303 becomes GET without body");
+        let looped = try? await c.get(base + "/loop");
+        expect(looped is none, "redirect limit");
+        let manual = try! await Client::new(ClientConfig { max_redirects: 0u32 }).get(base + "/redirect");
+        expect(manual.status == StatusCode::FOUND, "not followed");
+        let quick = Client::new(ClientConfig { timeout: Duration::ms(100) });
+        expect((await err_kind(quick, base + "/slow")) == ErrorKind::Timeout, "timeout");
+        expect((await err_kind(c, "http://127.0.0.1:1/")) == ErrorKind::Io, "refused");
+        expect((await err_kind(c, "https://example.com/")) == ErrorKind::Unsupported, "no TLS yet");
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn server_wire_behaviour() {
+    task::block_on(async {
+        let (srv, base) = start();
+        // Pipelined requests, answered in order.
+        let p = await raw(base, "GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n");
+        expect(p.contains("GET /1 HTTP/1.1") && p.contains("GET /2 HTTP/1.1") && (p.find("/1 ") ?? 0usize) < (p.find("/2 ") ?? 0usize), p);
+        // Chunked request with extensions and trailers.
+        let c = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n");
+        expect(c.contains("content-length: 5\r\n") && c.ends_with("\r\n\r\nabcde"), c);
+        // Expect: 100-continue gets the interim response once the body is read.
+        let e = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+        expect(e.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK"), e);
+        let e2 = await raw(base, "POST /x HTTP/1.1\r\nHost: a\r\nExpect: party\r\n\r\n");
+        expect(e2.starts_with("HTTP/1.1 417 "), e2);
+        // HTTP/1.0: close by default, keep-alive on request.
+        let ten = await raw(base, "GET / HTTP/1.0\r\n\r\n");
+        expect(ten.contains("connection: close"), ten);
+        // Smuggling attempts are refused and the connection closed: the
+        // second request must not be seen.
+        let s = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n");
+        expect(s.starts_with("HTTP/1.1 400 ") && !s.contains("smuggled"), s);
+        let nohost = await raw(base, "GET / HTTP/1.1\r\n\r\n");
+        expect(nohost.starts_with("HTTP/1.1 400 "), nohost);
+        let two = await raw(base, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+        expect(two.starts_with("HTTP/1.1 400 "), two);
+        let lf = await raw(base, "GET / HTTP/1.1\nHost: a\n\n");
+        expect(lf.starts_with("HTTP/1.1 400 "), lf);
+        let badchunk = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n");
+        expect(badchunk.contains("400 Bad Request") && badchunk.contains("connection: close"), badchunk);
+        let bigchunk = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffff\r\n");
+        expect(bigchunk.contains("400 Bad Request"), bigchunk);
+        let huge = await raw(base, "GET / HTTP/1.1\r\nHost: a\r\nX: " + "y".repeat(70000) + "\r\n\r\n");
+        expect(huge.starts_with("HTTP/1.1 431 "), "431");
+        // A handler that ignores the body: answered, connection closed.
+        let ig = await raw(base, "POST /ignore-body HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n0123456789GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+        expect(ig.contains("ignored") && ig.contains("connection: close") && !ig.contains("host=a"), ig);
+        await srv.shutdown();
+    });
+}
+
+#[test]
+fn body_limit_and_graceful_shutdown() {
+    task::block_on(async {
+        let (srv, base) = start(ServerConfig { max_body: 10u64 });
+        let r = await raw(base, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n\r\n01234567890123456789");
+        expect(r.starts_with("HTTP/1.1 400 ") && r.contains("too large"), r);
+        // An in-flight request finishes; then new connections are refused.
+        let c = Client::new();
+        let slow = task::spawn(async { (try! await c.get(base + "/slow")).status.as_u16() });
+        await task::sleep(Duration::ms(100));
+        await srv.shutdown();
+        expect((await slow) == 200u16, "in-flight request completed");
+        expect((await err_kind(Client::new(), base + "/")) == ErrorKind::Io, "listener closed");
+    });
+}

@@ -1,0 +1,493 @@
+// HTTP/1.1 message syntax (RFC 9112): strict head parsing, body
+// framing, chunked coding, serialization.
+//
+// Parsing is strict where leniency enables request smuggling or
+// response splitting: lines end in CRLF only (a bare CR or LF is an
+// error), no obs-fold, no whitespace before a field's colon, a single
+// valid Content-Length, Transfer-Encoding only as exactly `chunked` and
+// never together with Content-Length or in HTTP/1.0.
+
+use pkg::body::Chunk;
+use pkg::conn::{Io, deadline_in, left};
+use pkg::error::{HttpError, ErrorKind};
+use pkg::headers::{HeaderMap, is_token, is_field_value};
+use pkg::message::Version;
+use pkg::method::Method;
+use rok::std::time::SystemTime;
+
+/// Size limits of a message head.
+#[derive(Clone)]
+pub struct Limits {
+    /// Bytes of the request / status line plus fields.
+    pub max_head: usize = 65536;
+    pub max_fields: usize = 100;
+    /// Bytes of the request target.
+    pub max_target: usize = 8192;
+}
+
+/// A parse failure answered with HTTP status `status` (400, 414, 431,
+/// 501, 505).
+pub(pkg) fn bad(status: u16, msg: str) -> HttpError {
+    HttpError { kind: if status == 431u16 || status == 414u16 { ErrorKind::TooLarge } else { ErrorKind::Parse }, message: msg, code: status as u32 }
+}
+
+pub(pkg) struct ReqHead {
+    pub method: Method;
+    pub target: str;
+    pub version: Version;
+    pub headers: HeaderMap;
+}
+
+pub(pkg) struct RespHead {
+    pub status: u16;
+    pub version: Version;
+    pub headers: HeaderMap;
+}
+
+/// How the body of a message is delimited (RFC 9112 6.3).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(pkg) enum Framing {
+    Empty,
+    Length(u64),
+    Chunked,
+    /// Until the connection closes (responses only).
+    Close,
+}
+
+/// The head block (through the empty line), or `none` if the stream
+/// ended before its first byte. `first`: the deadline for that first
+/// byte; `rest`: for the remainder. Leading empty lines are skipped
+/// (RFC 9112 2.2).
+pub(pkg) async fn read_block(io: Io, max: usize, first: Instant | none, rest: Instant | none) throws (HttpError) -> List<u8> | none {
+    let started = false;
+    let scanned = 0usize;
+    loop {
+        if !started {
+            let p = io.peek();
+            let skip = 0usize;
+            while skip + 1 < p.len() && p[skip] == 0x0Du8 && p[skip + 1] == 0x0Au8 { skip += 2; }
+            if skip > 0 { io.consume(skip); }
+            let p2 = io.peek();
+            if p2.len() > 0 && !(p2.len() == 1 && p2[0] == 0x0Du8) { started = true; }
+        }
+        if started {
+            let p = io.peek();
+            let i = if scanned > 3 { scanned - 3 } else { 0usize };
+            while i < p.len() {
+                // A bare LF can never end the head: fail now, not at the timeout.
+                if p[i] == 0x0Au8 && (i == 0 || p[i - 1] != 0x0Du8) { throw bad(400u16, "bare LF in message head"); }
+                if i + 3 < p.len() && p[i] == 0x0Du8 && p[i + 1] == 0x0Au8 && p[i + 2] == 0x0Du8 && p[i + 3] == 0x0Au8 {
+                    if i + 4 > max { throw bad(431u16, "message head too large"); }
+                    return io.take(i + 4);
+                }
+                i += 1;
+            }
+            scanned = p.len();
+            if p.len() > max { throw bad(431u16, "message head too large"); }
+        }
+        let more = try await io.fill(if started { rest } else { first });
+        if !more {
+            if !started && io.buffered() == 0 { return none; }
+            throw HttpError::new(ErrorKind::Closed, "connection closed in message head");
+        }
+    }
+}
+
+/// The lines of a head block, without CRLFs; a bare CR or LF, a NUL or
+/// invalid UTF-8 is an error.
+fn lines_of(block: List<u8>) throws (HttpError) -> List<str> {
+    let out: List<str> = List::new();
+    let start = 0usize;
+    let i = 0usize;
+    let n = block.len() - 2;
+    while i < n {
+        let b = block[i];
+        if b == 0x0Du8 {
+            if block[i + 1] != 0x0Au8 { throw bad(400u16, "bare CR in message head"); }
+            out.push(try line_str(block, start, i));
+            i += 2;
+            start = i;
+            continue;
+        }
+        if b == 0x0Au8 { throw bad(400u16, "bare LF in message head"); }
+        if b == 0u8 { throw bad(400u16, "NUL in message head"); }
+        i += 1;
+    }
+    out
+}
+
+fn line_str(block: List<u8>, a: usize, b: usize) throws (HttpError) -> str {
+    try str::from_utf8(block[a:b]) catch _ { throw bad(400u16, "message head is not UTF-8"); }
+}
+
+/// `HTTP/1.1` / `HTTP/1.0`; another `HTTP/x.y` is 505, anything else
+/// 400.
+fn parse_version(s: str) throws (HttpError) -> Version {
+    if s == "HTTP/1.1" { return Version::Http11; }
+    if s == "HTTP/1.0" { return Version::Http10; }
+    let b = s.as_bytes();
+    if b.len() == 8 && s.starts_with("HTTP/") && is_digit(b[5]) && b[6] == 0x2Eu8 && is_digit(b[7]) {
+        throw bad(505u16, f"unsupported version {s}");
+    }
+    throw bad(400u16, f"invalid version {s:?}");
+}
+
+/// Header fields from lines `from..`, strictly (RFC 9112 5).
+fn parse_fields(lines: List<str>, from: usize, lim: Limits) throws (HttpError) -> HeaderMap {
+    let h = HeaderMap::new();
+    if lines.len() - from > lim.max_fields { throw bad(431u16, "too many header fields"); }
+    for i in from..lines.len() {
+        let l = lines[i];
+        if l.starts_with(" ") || l.starts_with("\t") { throw bad(400u16, "obsolete line folding"); }
+        let (name, value) = l.split_once(":") ?? { throw bad(400u16, f"invalid field line {l:?}"); };
+        if !is_token(name) { throw bad(400u16, f"invalid field name {name:?}"); }
+        let v = trim_ows(value);
+        if !is_field_value(v) { throw bad(400u16, f"invalid value for field {name}"); }
+        h.append(name, v);
+    }
+    h
+}
+
+fn is_digit(b: u8) -> bool { b >= 0x30u8 && b <= 0x39u8 }
+
+fn trim_ows(s: str) -> str {
+    let b = s.as_bytes();
+    let a = 0usize;
+    let e = b.len();
+    while a < e && (b[a] == 0x20u8 || b[a] == 0x09u8) { a += 1; }
+    while e > a && (b[e - 1] == 0x20u8 || b[e - 1] == 0x09u8) { e -= 1; }
+    s[a:e]
+}
+
+pub(pkg) fn parse_request_head(block: List<u8>, lim: Limits) throws (HttpError) -> ReqHead {
+    let lines = try lines_of(block);
+    if lines.is_empty() { throw bad(400u16, "empty request"); }
+    let parts: List<str> = lines[0].split(" ").collect();
+    if parts.len() != 3 { throw bad(400u16, f"invalid request line {lines[0]:?}"); }
+    let m = try Method::parse(parts[0]) catch _ { throw bad(400u16, f"invalid method {parts[0]:?}"); };
+    let target = parts[1];
+    if target.is_empty() { throw bad(400u16, "empty request target"); }
+    if target.len() > lim.max_target { throw bad(414u16, "request target too long"); }
+    for b in target.bytes() {
+        if b <= 0x20u8 || b == 0x7Fu8 { throw bad(400u16, "invalid request target"); }
+    }
+    let v = try parse_version(parts[2]);
+    ReqHead { method: m, target: target, version: v, headers: try parse_fields(lines, 1, lim) }
+}
+
+pub(pkg) fn parse_response_head(block: List<u8>, lim: Limits) throws (HttpError) -> RespHead {
+    let lines = try lines_of(block);
+    if lines.is_empty() { throw bad(400u16, "empty response"); }
+    let l = lines[0];
+    let (vs, rest) = l.split_once(" ") ?? { throw bad(400u16, f"invalid status line {l:?}"); };
+    let v = try parse_version(vs);
+    let code_s = rest[:rest.find(" ") ?? rest.len()];
+    let cb = code_s.as_bytes();
+    if cb.len() != 3 || !is_digit(cb[0]) || !is_digit(cb[1]) || !is_digit(cb[2]) || cb[0] == 0x30u8 {
+        throw bad(400u16, f"invalid status line {l:?}");
+    }
+    let code = ((cb[0] - 0x30u8) as u16) * 100u16 + ((cb[1] - 0x30u8) as u16) * 10u16 + (cb[2] - 0x30u8) as u16;
+    for b in rest.bytes() {
+        if b < 0x20u8 && b != 0x09u8 || b == 0x7Fu8 { throw bad(400u16, "control character in reason phrase"); }
+    }
+    RespHead { status: code, version: v, headers: try parse_fields(lines, 1, lim) }
+}
+
+/// The single valid Content-Length, if any.
+fn content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
+    let all = h.get_all("content-length");
+    if all.is_empty() { return none; }
+    if all.len() > 1 { throw bad(400u16, "repeated Content-Length"); }
+    let s = all[0];
+    if s.is_empty() || s.len() > 18 { throw bad(400u16, f"invalid Content-Length {s:?}"); }
+    let n = 0u64;
+    for b in s.bytes() {
+        if b < 0x30u8 || b > 0x39u8 { throw bad(400u16, f"invalid Content-Length {s:?}"); }
+        n = n * 10u64 + (b - 0x30u8) as u64;
+    }
+    n
+}
+
+/// The transfer codings, lowercase, in order.
+fn codings(h: HeaderMap) -> List<str> {
+    let out: List<str> = List::new();
+    for v in h.get_all("transfer-encoding") {
+        for p in v.split(",") { out.push(trim_ows(p).to_lowercase()); }
+    }
+    out
+}
+
+pub(pkg) fn request_framing(h: ReqHead) throws (HttpError) -> Framing {
+    let te = codings(h.headers);
+    if !te.is_empty() {
+        if h.version == Version::Http10 { throw bad(400u16, "Transfer-Encoding in HTTP/1.0"); }
+        if h.headers.contains("content-length") { throw bad(400u16, "both Transfer-Encoding and Content-Length"); }
+        if te[te.len() - 1] != "chunked" { throw bad(400u16, "Transfer-Encoding does not end in chunked"); }
+        if te.len() != 1 { throw bad(501u16, "unsupported transfer coding"); }
+        return Framing::Chunked;
+    }
+    match try content_length(h.headers) {
+        n: u64 => if n == 0u64 { Framing::Empty } else { Framing::Length(n) },
+        none => Framing::Empty,
+    }
+}
+
+pub(pkg) fn response_framing(method: Method, h: RespHead) throws (HttpError) -> Framing {
+    if method == Method::HEAD || h.status < 200u16 || h.status == 204u16 || h.status == 304u16 { return Framing::Empty; }
+    let te = codings(h.headers);
+    if !te.is_empty() {
+        if h.headers.contains("content-length") { throw bad(400u16, "both Transfer-Encoding and Content-Length"); }
+        if te[te.len() - 1] != "chunked" { return Framing::Close; }
+        if te.len() != 1 { throw HttpError::new(ErrorKind::Unsupported, "unsupported transfer coding"); }
+        return Framing::Chunked;
+    }
+    match try content_length(h.headers) {
+        n: u64 => if n == 0u64 { Framing::Empty } else { Framing::Length(n) },
+        none => Framing::Close,
+    }
+}
+
+/// A line ending in CRLF (without it), at most `max` bytes.
+async fn read_line(io: Io, max: usize, deadline: Instant | none) throws (HttpError) -> str {
+    let scanned = 0usize;
+    loop {
+        let p = io.peek();
+        let i = scanned;
+        while i < p.len() {
+            let b = p[i];
+            if b == 0x0Au8 { throw bad(400u16, "bare LF"); }
+            if b == 0x0Du8 {
+                if i + 1 == p.len() { break; }
+                if p[i + 1] != 0x0Au8 { throw bad(400u16, "bare CR"); }
+                let line = io.take(i);
+                io.consume(2);
+                return try str::from_utf8(line) catch _ { throw bad(400u16, "line is not UTF-8"); };
+            }
+            if b < 0x20u8 && b != 0x09u8 || b == 0x7Fu8 { throw bad(400u16, "control character"); }
+            i += 1;
+        }
+        scanned = i;
+        if p.len() > max { throw bad(400u16, "line too long"); }
+        if !(try await io.fill(deadline)) { throw HttpError::new(ErrorKind::Closed, "connection closed in body"); }
+    }
+}
+
+/// A chunk-size line's size (RFC 9112 7.1); extensions are checked and
+/// dropped.
+fn chunk_size(line: str) throws (HttpError) -> u64 {
+    let b = line.as_bytes();
+    let n = 0u64;
+    let i = 0usize;
+    while i < b.len() {
+        let d = match hex_digit(b[i]) {
+            v: u64 => v,
+            none => break,
+        };
+        if i >= 15 { throw bad(400u16, "chunk size too large"); }
+        n = n * 16u64 + d;
+        i += 1;
+    }
+    if i == 0 { throw bad(400u16, f"invalid chunk size {line:?}"); }
+    let ext = trim_ows(line[i:]);
+    if !ext.is_empty() && !ext.starts_with(";") { throw bad(400u16, f"invalid chunk size {line:?}"); }
+    n
+}
+
+fn hex_digit(b: u8) -> u64 | none {
+    if b >= 0x30u8 && b <= 0x39u8 { return (b - 0x30u8) as u64; }
+    if b >= 0x61u8 && b <= 0x66u8 { return (b - 0x61u8 + 10u8) as u64; }
+    if b >= 0x41u8 && b <= 0x46u8 { return (b - 0x41u8 + 10u8) as u64; }
+    none
+}
+
+/// Tag of the "handler finished" message on a pump's credit channel.
+pub(pkg) const DONE: u32 = 0xFFFFFFFFu32;
+
+/// How a body pump ended.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(pkg) enum Pumped {
+    /// The whole body was read; the connection is at the next message.
+    Complete,
+    /// The body ends with the connection.
+    ToClose,
+    /// The reader stopped asking (or `DONE` came) before the end.
+    Abandoned,
+    /// A read or framing error (delivered to the reader too).
+    Failed,
+}
+
+/// Body pump options.
+pub(pkg) struct PumpOpts {
+    /// Written before the first read (`100 Continue`).
+    pub cont: str | none = none;
+    /// Longest wait for one socket read.
+    pub read_timeout: Duration | none = none;
+    /// Longest wait for the reader to ask for more.
+    pub want_timeout: Duration | none = none;
+    /// More than this many bytes fails with `TooLarge`.
+    pub max: u64 | none = none;
+}
+
+/// Feed the body framed by `fr` from `io` to `tx`, one piece per
+/// demand message on `credit` (see `Body`).
+pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) -> Pumped {
+    let r = try await pump_inner(io, fr, tx, credit, opts) catch e: HttpError {
+        try? await tx.send_async(e);
+        tx.close();
+        Pumped::Failed
+    };
+    r
+}
+
+async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) throws (HttpError) -> Pumped {
+    let remaining = match fr {
+        Framing::Length(n) => n,
+        Framing::Empty => {
+            tx.close();
+            return Pumped::Complete;
+        },
+        _ => 0u64,
+    };
+    let chunk_left = 0u64;
+    let total = 0u64;
+    let cont = opts.cont;
+    loop {
+        // Wait for a demand.
+        let m = await recv_within(credit, opts.want_timeout);
+        match m {
+            x: (u32, usize) => {
+                let (t, n) = x;
+                if t == DONE { return Pumped::Abandoned; }
+                if n > 0 { continue; }
+            },
+            none => return Pumped::Abandoned,
+        }
+        if let c: str = cont {
+            try await io.write(c.as_bytes(), deadline_in(opts.read_timeout));
+            cont = none;
+        }
+        let dl = deadline_in(opts.read_timeout);
+        let piece: List<u8> = List::new();
+        let last = false;
+        match fr {
+            Framing::Length(_) => {
+                if io.buffered() == 0 { try await io.need(1, dl); }
+                let k = io.buffered() as u64;
+                if k > remaining { k = remaining; }
+                piece = io.take(k as usize);
+                remaining -= k;
+                last = remaining == 0u64;
+            },
+            Framing::Close => {
+                if io.buffered() == 0 && !(try await io.fill(dl)) {
+                    tx.close();
+                    return Pumped::ToClose;
+                }
+                piece = io.take(io.buffered());
+            },
+            _ => {
+                if chunk_left == 0u64 {
+                    let size = try chunk_size(try await read_line(io, 4096, dl));
+                    if size == 0u64 {
+                        // Trailer fields are read and dropped.
+                        let trailer = 0usize;
+                        loop {
+                            let l = try await read_line(io, 8192, dl);
+                            if l.is_empty() { break; }
+                            if l.starts_with(" ") || l.starts_with("\t") || !l.contains(":") { throw bad(400u16, "invalid trailer"); }
+                            trailer += l.len();
+                            if trailer > 65536 { throw bad(431u16, "trailers too large"); }
+                        }
+                        tx.close();
+                        return Pumped::Complete;
+                    }
+                    chunk_left = size;
+                }
+                if io.buffered() == 0 { try await io.need(1, dl); }
+                let k = io.buffered() as u64;
+                if k > chunk_left { k = chunk_left; }
+                piece = io.take(k as usize);
+                chunk_left -= k;
+                if chunk_left == 0u64 {
+                    try await io.need(2, dl);
+                    let p = io.peek();
+                    if p[0] != 0x0Du8 || p[1] != 0x0Au8 { throw bad(400u16, "chunk data not followed by CRLF"); }
+                    io.consume(2);
+                }
+            },
+        }
+        total += piece.len() as u64;
+        if let mx: u64 = opts.max {
+            if total > mx { throw HttpError { kind: ErrorKind::TooLarge, message: "body too large", code: 413u32 }; }
+        }
+        if piece.len() > 0 {
+            try await tx.send_async(piece) catch _ { return Pumped::Abandoned; };
+        }
+        if last {
+            tx.close();
+            return Pumped::Complete;
+        }
+    }
+}
+
+async fn recv_any<T>(rx: Receiver<T>) -> T | none { await rx.recv_async() }
+
+async fn nothing<T>(d: Duration) -> T | none {
+    await task::sleep(d);
+    none
+}
+
+/// The next message of `rx`, or `none` when closed or after `limit`.
+pub(pkg) async fn recv_within<T>(rx: Receiver<T>, limit: Duration | none) -> T | none {
+    match limit {
+        none => await rx.recv_async(),
+        d: Duration => {
+            let (_, x) = await task::select([recv_any(rx), nothing::<T>(d)]);
+            x
+        },
+    }
+}
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110 5.6.7) for Unix time
+/// `secs`.
+pub fn http_date(secs: i64) -> str {
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][(days.rem_euclid(7)) as usize];
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m - 1) as usize];
+    f"{wd}, {d:02} {mon} {y:04} {sod / 3600:02}:{sod % 3600 / 60:02}:{sod % 60:02} GMT"
+}
+
+pub(pkg) fn date_now() -> str { http_date((try? SystemTime::now().unix_seconds()) ?? 0i64) }
+
+/// Write `h` as field lines, skipping the names in `skip`.
+pub(pkg) fn push_fields(out: StrBuf, h: HeaderMap, skip: List<str>) {
+    for (n, v) in h.entries() {
+        let drop = false;
+        for s in skip {
+            if s == n { drop = true; }
+        }
+        if !drop {
+            out.push_str(n);
+            out.push_str(": ");
+            out.push_str(v);
+            out.push_str("\r\n");
+        }
+    }
+}
+
+/// The bytes of `s` followed by `tail`.
+pub(pkg) fn concat(s: str, tail: List<u8>) -> List<u8> {
+    let out = s.as_bytes().to_list();
+    out.extend(tail);
+    out
+}
