@@ -36,7 +36,7 @@ pub struct ServerConfig {
     pub max_body: u64 | none = none;
     /// Speak HTTP/2: offered as "h2" over TLS, by prior knowledge on
     /// plaintext connections.
-    pub http2: bool = true;
+    pub http2: bool = cfg!(feature = "http2");
     /// HTTP/2 settings.
     pub h2: h2::Config = h2::Config {};
 }
@@ -70,6 +70,7 @@ pub async fn serve(addr: str, handler: Handler) throws (HttpError) {
     try await s.run();
 }
 
+#[cfg(feature = "tls")]
 /// Serve `handler` over TLS on `addr` until the process ends.
 pub async fn serve_tls(addr: str, tls_cfg: tls::ServerConfig, handler: Handler) throws (HttpError) {
     let s = try Server::bind_tls(addr, handler, tls_cfg);
@@ -111,6 +112,7 @@ impl Server {
         }
     }
 
+    #[cfg(feature = "tls")]
     /// `bind` for TLS with `tls_cfg`'s certificate and key; ALPN is set
     /// by the server.
     pub fn bind_tls(addr: str, handler: Handler, tls_cfg: tls::ServerConfig, cfg: ServerConfig | none = none) throws (HttpError) -> Server {
@@ -208,7 +210,7 @@ impl Server {
         let ok = !self.stopping.load();
         let secure = self.tls_config();
         if let tc: tls::ServerConfig = secure {
-            tc.alpn_protocols = if self.cfg.http2 { [H2.as_bytes().to_list(), H11.as_bytes().to_list()] } else { [H11.as_bytes().to_list()] };
+            tc.alpn_protocols = alpn(self.cfg.http2);
             io = try await start_tls(io, Side::Server(tc), deadline_in(self.cfg.header_timeout)) catch _ {
                 ok = false;
                 io
@@ -222,7 +224,7 @@ impl Server {
             if is_h2 {
                 let (dtx, drx) = channel::<i32>();
                 self.set_entry(id, ConnEntry { s: s, idle: false, drain: dtx });
-                await h2::serve_conn(io, self.handler, self.cfg.h2, drx);
+                await self.serve_h2(io, drx);
                 dtx.close();
             } else {
                 await self.serve_h1(io, id);
@@ -232,6 +234,16 @@ impl Server {
         using g = self.conns.lock() { g.get().remove(id); }
     }
 
+    #[cfg(feature = "http2")]
+    async fn serve_h2(self, io: Io, drain: Receiver<i32>) { await h2::serve_conn(io, self.handler, self.cfg.h2, drain); }
+
+    #[cfg(not(feature = "http2"))]
+    async fn serve_h2(self, io: Io, drain: Receiver<i32>) {}
+
+    #[cfg(not(feature = "http1"))]
+    async fn serve_h1(self, io: Io, id: u64) {}
+
+    #[cfg(feature = "http1")]
     async fn serve_h1(self, io: Io, id: u64) {
         let cfg = self.cfg;
         loop {
@@ -255,6 +267,7 @@ impl Server {
     }
 
     /// One request / response; whether the connection stays open.
+    #[cfg(feature = "http1")]
     async fn exchange(self, io: Io, block: List<u8>) throws (HttpError) -> bool {
         let cfg = self.cfg;
         let head = try h1::parse_request_head(block, cfg.limits);
@@ -307,6 +320,14 @@ impl Server {
 /// ALPN protocol ids.
 pub(pkg) const H2: str = "h2";
 pub(pkg) const H11: str = "http/1.1";
+
+/// The ALPN protocols a connection may use, by preference.
+pub(pkg) fn alpn(http2: bool) -> List<List<u8>> {
+    let l: List<List<u8>> = [];
+    if http2 && cfg!(feature = "http2") { l.push(H2.as_bytes().to_list()); }
+    if cfg!(feature = "http1") { l.push(H11.as_bytes().to_list()); }
+    l
+}
 
 const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 

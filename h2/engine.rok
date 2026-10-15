@@ -1,0 +1,864 @@
+// The HTTP/2 connection engine: per connection, the reading task
+// (frames in, HPACK decoder, receive flow control), a writer task
+// (`writer::run`: frames out, HPACK encoder, send windows, RFC 9218
+// scheduling) and a credit task that turns body consumption into
+// WINDOW_UPDATEs. Stream state shared by them sits behind one mutex.
+
+use pkg::body::{Body, Chunk};
+use pkg::conn::{Io, Wire, deadline_in, left, spawn_with};
+use pkg::error::{HttpError, ErrorKind};
+use pkg::h1;
+use pkg::h1::recv_within;
+use pkg::h2::frame::{Frame, conn_err, u32_at};
+use pkg::h2::frame::{PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, CANCEL, INTERNAL_ERROR, NO_ERROR, COMPRESSION_ERROR, ENHANCE_YOUR_CALM};
+use pkg::h2::hpack::Decoder;
+use pkg::h2::writer::Cmd;
+use pkg::headers::{HeaderMap, is_tchar};
+use pkg::message::{Request, Response, Version};
+use pkg::method::Method;
+use pkg::server::Handler;
+use pkg::status::StatusCode;
+use pkg::uri::Uri;
+use pkg::h2::Config;
+use pkg::h2::writer;
+use pkg::h2::frame;
+
+struct StreamIn {
+    /// Where DATA goes; `none` before a body exists or once it ended.
+    body: Sender<Chunk> | none = none;
+    /// Client: the waiter of the response head (taken on delivery).
+    head: Sender<Response | HttpError> | none = none;
+    method_head: bool = false;
+    /// Our receive window for the stream, and consumed bytes not yet
+    /// returned to it.
+    window: i64;
+    unacked: i64 = 0i64;
+    expect: u64 | none = none;
+    got: u64 = 0u64;
+    remote_done: bool = false;
+    local_done: bool = false;
+}
+
+struct State {
+    streams: Dict<u32, StreamIn>;
+    next_id: u32 = 1u32;
+    /// Highest stream id the peer opened.
+    last_peer: u32 = 0u32;
+    /// The peer's GOAWAY last-stream-id.
+    goaway: u32 | none = none;
+    closed: bool = false;
+    draining: bool = false;
+    peer_max: u32 = 100u32;
+    /// Received connection-level bytes not yet returned.
+    conn_unacked: i64 = 0i64;
+}
+
+/// A connection's shared side. Copies share it.
+pub(pkg) struct Shared {
+    st: Mutex<State>;
+    w: Sender<Cmd>;
+    credit: Sender<(u32, usize)>;
+    cfg: Config;
+    server: bool;
+    /// The writer task: done once everything queued is written.
+    wtask: Task<i32>;
+}
+
+fn closed_err(msg: str) -> HttpError { HttpError::new(ErrorKind::Closed, msg) }
+
+fn reset_err(code: u32) -> HttpError { HttpError { kind: ErrorKind::Reset, message: f"stream reset (code {code})", code: code } }
+
+impl Shared {
+    /// Start the writer and credit tasks and queue our preface settings.
+    fn new(w: Wire, cfg: Config, server: bool) -> Shared {
+        let (wtx, wrx) = channel::<Cmd>();
+        let (ctx, crx) = channel::<(u32, usize)>();
+        let huff = cfg.huffman;
+        let wt = cfg.write_timeout;
+        let wtask = task::spawn(async {
+            await writer::run(w, wrx, huff, wt);
+            0
+        });
+        let sh = Shared { st: Mutex::new(State { streams: Dict::new() }), w: wtx, credit: ctx, cfg: cfg, server: server, wtask: wtask };
+        task::spawn(async {
+            await sh.credits(crx);
+            0
+        });
+        let out = frame::settings([
+            (frame::S_ENABLE_PUSH, 0u32),
+            (frame::S_MAX_CONCURRENT_STREAMS, cfg.max_concurrent_streams),
+            (frame::S_INITIAL_WINDOW_SIZE, cfg.initial_window_size),
+            (frame::S_MAX_FRAME_SIZE, cfg.max_frame_size),
+            (frame::S_MAX_HEADER_LIST_SIZE, cfg.max_header_list_size),
+        ]);
+        if cfg.connection_window_size > 65535u32 { out.extend(frame::window_update(0u32, cfg.connection_window_size - 65535u32)); }
+        sh.raw(out);
+        sh
+    }
+
+    fn cmd(self, c: Cmd) { try? self.w.send(c); }
+
+    fn raw(self, b: List<u8>) { self.cmd(Cmd::Raw(b)); }
+
+    fn stream(self, sid: u32) -> StreamIn | none {
+        let r: StreamIn | none = none;
+        using g = self.st.lock() { r = g.get().streams.get(sid); }
+        r
+    }
+
+    fn put(self, sid: u32, si: StreamIn) {
+        using g = self.st.lock() { g.get().streams.insert(sid, si); }
+    }
+
+    fn closed(self) -> bool {
+        let c = true;
+        using g = self.st.lock() { c = g.get().closed; }
+        c
+    }
+
+    /// Whether `sid` was never opened (5.1: frames on idle streams).
+    fn is_idle(self, sid: u32) -> bool {
+        let st = self.snapshot();
+        if self.server { sid % 2u32 == 0u32 || sid > st.last_peer } else { sid % 2u32 == 0u32 || sid >= st.next_id }
+    }
+
+    fn snapshot(self) -> State {
+        let s = State { streams: Dict::new() };
+        using g = self.st.lock() { s = g.get(); }
+        s
+    }
+
+    /// Drop a stream, failing its waiters with `e`.
+    fn fail(self, sid: u32, e: HttpError) {
+        let si: StreamIn | none = none;
+        using g = self.st.lock() { si = g.get().streams.remove(sid); }
+        if let x: StreamIn = si {
+            if let b: Sender<Chunk> = x.body {
+                try? b.send(e);
+                b.close();
+            }
+            if let h: Sender<Response | HttpError> = x.head { try? h.send(e); }
+        }
+        self.cmd(Cmd::Reset(sid));
+        self.check_drained();
+    }
+
+    /// Stream error: RST_STREAM `code` and drop the stream.
+    fn reset(self, sid: u32, code: u32) {
+        self.raw(frame::rst(sid, code));
+        self.fail(sid, reset_err(code));
+    }
+
+    /// One side of `sid` is done; the stream goes when both are.
+    fn finish(self, sid: u32, local: bool) {
+        let gone = false;
+        using g = self.st.lock() {
+            let st = g.get();
+            if let si: StreamIn = st.streams.get(sid) {
+                if local { si.local_done = true; } else { si.remote_done = true; }
+                if si.local_done && si.remote_done {
+                    st.streams.remove(sid);
+                    gone = true;
+                } else {
+                    st.streams.insert(sid, si);
+                }
+            }
+        }
+        if gone { self.check_drained(); }
+    }
+
+    /// While draining, close once the last stream is done.
+    fn check_drained(self) {
+        let st = self.snapshot();
+        if st.draining && st.streams.is_empty() { self.cmd(Cmd::Close); }
+    }
+
+    /// Stop accepting streams: GOAWAY with the last stream we took.
+    fn drain(self) {
+        let last = 0u32;
+        using g = self.st.lock() {
+            let st = g.get();
+            st.draining = true;
+            last = st.last_peer;
+            g.set(st);
+        }
+        self.raw(frame::goaway(last, NO_ERROR, ""));
+        self.check_drained();
+    }
+
+    /// The connection is over: fail every stream, stop the tasks.
+    fn shut(self, why: HttpError) {
+        let ids: List<u32> = List::new();
+        using g = self.st.lock() {
+            let st = g.get();
+            st.closed = true;
+            g.set(st);
+            for k in st.streams.keys() { ids.push(k); }
+        }
+        for sid in ids { self.fail(sid, why); }
+        self.cmd(Cmd::Close);
+        self.w.close();
+        self.credit.close();
+    }
+
+    /// Return consumed body bytes to stream windows (batched to a
+    /// quarter of the window).
+    async fn credits(self, rx: Receiver<(u32, usize)>) {
+        let quarter = (self.cfg.initial_window_size / 4u32) as i64;
+        loop {
+            let m = await rx.recv_async();
+            let (sid, n) = match m {
+                x: (u32, usize) => x,
+                none => break,
+            };
+            if n == 0 { continue; }
+            let inc = 0i64;
+            using g = self.st.lock() {
+                let st = g.get();
+                if let si: StreamIn = st.streams.get(sid) {
+                    if !si.remote_done {
+                        si.unacked = si.unacked + n as i64;
+                        if si.unacked >= quarter {
+                            inc = si.unacked;
+                            si.window = si.window + inc;
+                            si.unacked = 0i64;
+                        }
+                        st.streams.insert(sid, si);
+                    }
+                }
+            }
+            if inc > 0i64 { self.raw(frame::window_update(sid, inc as u32)); }
+        }
+    }
+
+    // ---- reading ----
+
+    /// Read frames until the connection ends. `handler`: serve requests
+    /// (server); `none`: deliver responses (client).
+    async fn read_loop(self, io: Io, handler: Handler | none) {
+        let why = try {
+            await self.frames(io, handler);
+            closed_err("connection closed")
+        } catch e: HttpError {
+            if e.kind == ErrorKind::Protocol {
+                let last = self.snapshot().last_peer;
+                self.raw(frame::goaway(last, e.code, e.message));
+            }
+            e
+        };
+        self.shut(why);
+        // Let the writer flush (GOAWAY) before the socket is closed.
+        await self.wtask;
+    }
+
+    async fn frames(self, io: Io, handler: Handler | none) throws (HttpError) {
+        let dec = Decoder::new();
+        let started = false;
+        let cfg = self.cfg;
+        loop {
+            let idle: Instant | none = none;
+            if self.server && self.snapshot().streams.is_empty() { idle = deadline_in(cfg.idle_timeout); }
+            let f = try await frame::read(io, cfg.max_frame_size, idle) catch e: HttpError {
+                if e.kind == ErrorKind::Timeout { return; }
+                throw e;
+            };
+            let fr = match f {
+                x: Frame => x,
+                none => return,
+            };
+            if !started {
+                if fr.typ != frame::SETTINGS || fr.has(frame::ACK) { throw conn_err(PROTOCOL_ERROR, "first frame is not SETTINGS"); }
+                started = true;
+            }
+            let t = fr.typ;
+            let n = fr.payload.len();
+            if t == frame::DATA {
+                try self.on_data(fr);
+            } else if t == frame::HEADERS {
+                try await self.on_headers(io, dec, fr, handler);
+            } else if t == frame::SETTINGS {
+                try self.on_settings(fr);
+            } else if t == frame::PING {
+                if fr.sid != 0u32 { throw conn_err(PROTOCOL_ERROR, "PING on a stream"); }
+                if n != 8 { throw conn_err(FRAME_SIZE_ERROR, "PING length"); }
+                if !fr.has(frame::ACK) { self.raw(frame::frame(frame::PING, frame::ACK, 0u32, fr.payload)); }
+            } else if t == frame::GOAWAY {
+                if fr.sid != 0u32 { throw conn_err(PROTOCOL_ERROR, "GOAWAY on a stream"); }
+                if n < 8 { throw conn_err(FRAME_SIZE_ERROR, "GOAWAY length"); }
+                self.on_goaway(u32_at(fr.payload, 0) & 0x7FFFFFFFu32);
+            } else if t == frame::WINDOW_UPDATE {
+                if n != 4 { throw conn_err(FRAME_SIZE_ERROR, "WINDOW_UPDATE length"); }
+                let inc = u32_at(fr.payload, 0) & 0x7FFFFFFFu32;
+                if fr.sid != 0u32 && self.is_idle(fr.sid) { throw conn_err(PROTOCOL_ERROR, "WINDOW_UPDATE on an idle stream"); }
+                if inc == 0u32 {
+                    if fr.sid == 0u32 { throw conn_err(PROTOCOL_ERROR, "zero WINDOW_UPDATE"); }
+                    self.reset(fr.sid, PROTOCOL_ERROR);
+                } else {
+                    self.cmd(Cmd::Window(fr.sid, inc));
+                }
+            } else if t == frame::RST_STREAM {
+                if fr.sid == 0u32 { throw conn_err(PROTOCOL_ERROR, "RST_STREAM on stream 0"); }
+                if n != 4 { throw conn_err(FRAME_SIZE_ERROR, "RST_STREAM length"); }
+                if self.is_idle(fr.sid) { throw conn_err(PROTOCOL_ERROR, "RST_STREAM on an idle stream"); }
+                self.fail(fr.sid, reset_err(u32_at(fr.payload, 0)));
+            } else if t == frame::PRIORITY {
+                if fr.sid == 0u32 { throw conn_err(PROTOCOL_ERROR, "PRIORITY on stream 0"); }
+                if n != 5 { self.reset(fr.sid, FRAME_SIZE_ERROR); }
+            } else if t == frame::PRIORITY_UPDATE {
+                if fr.sid != 0u32 { throw conn_err(PROTOCOL_ERROR, "PRIORITY_UPDATE on a stream"); }
+                if n < 4 { throw conn_err(FRAME_SIZE_ERROR, "PRIORITY_UPDATE length"); }
+                if self.server {
+                    let v = pkg::uri::utf8_lossy(fr.payload[4:n].to_list());
+                    self.cmd(Cmd::Priority(u32_at(fr.payload, 0) & 0x7FFFFFFFu32, frame::parse_priority(v)));
+                }
+            } else if t == frame::PUSH_PROMISE {
+                throw conn_err(PROTOCOL_ERROR, "PUSH_PROMISE (push is disabled)");
+            } else if t == frame::CONTINUATION {
+                throw conn_err(PROTOCOL_ERROR, "CONTINUATION without HEADERS");
+            }
+            // Unknown frame types are ignored (5.5).
+        }
+    }
+
+    fn on_settings(self, fr: Frame) throws (HttpError) {
+        if fr.sid != 0u32 { throw conn_err(PROTOCOL_ERROR, "SETTINGS on a stream"); }
+        if fr.has(frame::ACK) {
+            if !fr.payload.is_empty() { throw conn_err(FRAME_SIZE_ERROR, "SETTINGS ACK with payload"); }
+            return;
+        }
+        if fr.payload.len() % 6 != 0 { throw conn_err(FRAME_SIZE_ERROR, "SETTINGS length"); }
+        let pairs: List<(u16, u32)> = List::new();
+        let i = 0usize;
+        while i < fr.payload.len() {
+            let k = (fr.payload[i] as u16) << 8u16 | fr.payload[i + 1] as u16;
+            let v = u32_at(fr.payload, i + 2);
+            if k == frame::S_ENABLE_PUSH && (v > 1u32 || !self.server && v != 0u32) {
+                throw conn_err(PROTOCOL_ERROR, "invalid SETTINGS_ENABLE_PUSH");
+            }
+            if k == frame::S_INITIAL_WINDOW_SIZE && v > 2147483647u32 { throw conn_err(FLOW_CONTROL_ERROR, "invalid initial window"); }
+            if k == frame::S_MAX_FRAME_SIZE && (v < 16384u32 || v > 16777215u32) { throw conn_err(PROTOCOL_ERROR, "invalid max frame size"); }
+            if k == frame::S_MAX_CONCURRENT_STREAMS {
+                using g = self.st.lock() {
+                    let st = g.get();
+                    st.peer_max = v;
+                    g.set(st);
+                }
+            }
+            pairs.push((k, v));
+            i += 6;
+        }
+        self.cmd(Cmd::Settings(pairs));
+    }
+
+    fn on_goaway(self, last: u32) {
+        let doomed: List<u32> = List::new();
+        using g = self.st.lock() {
+            let st = g.get();
+            st.goaway = last;
+            g.set(st);
+            if !self.server {
+                for k in st.streams.keys() {
+                    if k > last { doomed.push(k); }
+                }
+            }
+        }
+        // Streams the server never processed: safe to retry elsewhere.
+        for sid in doomed { self.fail(sid, closed_err(pkg::client::STALE)); }
+    }
+
+    fn on_data(self, fr: Frame) throws (HttpError) {
+        let sid = fr.sid;
+        if sid == 0u32 { throw conn_err(PROTOCOL_ERROR, "DATA on stream 0"); }
+        let data = try frame::unpad(fr);
+        let flow = fr.payload.len() as i64;
+        let cw = self.cfg.connection_window_size as i64;
+        let ret = 0i64;
+        let overflow = false;
+        using g = self.st.lock() {
+            let st = g.get();
+            if flow > cw - st.conn_unacked {
+                overflow = true;
+            } else {
+                st.conn_unacked = st.conn_unacked + flow;
+                if st.conn_unacked >= cw / 2 {
+                    ret = st.conn_unacked;
+                    st.conn_unacked = 0i64;
+                }
+                g.set(st);
+            }
+        }
+        if overflow { throw conn_err(FLOW_CONTROL_ERROR, "connection window exceeded"); }
+        if ret > 0i64 { self.raw(frame::window_update(0u32, ret as u32)); }
+        let si = match self.stream(sid) {
+            x: StreamIn => x,
+            none => {
+                if self.is_idle(sid) { throw conn_err(PROTOCOL_ERROR, "DATA on an idle stream"); }
+                self.raw(frame::rst(sid, STREAM_CLOSED));
+                return;
+            },
+        };
+        if si.remote_done || si.head is Sender<Response | HttpError> {
+            self.reset(sid, STREAM_CLOSED);
+            return;
+        }
+        if flow > si.window {
+            self.reset(sid, FLOW_CONTROL_ERROR);
+            return;
+        }
+        si.window = si.window - flow;
+        let pad = flow - data.len() as i64;
+        if pad > 0i64 {
+            si.window = si.window + pad;
+            self.raw(frame::window_update(sid, pad as u32));
+        }
+        si.got = si.got + data.len() as u64;
+        let end = fr.has(frame::END_STREAM);
+        if let e: u64 = si.expect {
+            if si.got > e || end && si.got != e {
+                self.reset(sid, PROTOCOL_ERROR);
+                return;
+            }
+        }
+        self.put(sid, si);
+        if let b: Sender<Chunk> = si.body {
+            if !data.is_empty() { try? b.send(data); }
+            if end { b.close(); }
+        }
+        if end { self.finish(sid, false); }
+    }
+
+    /// A header block (HEADERS plus CONTINUATIONs), decoded.
+    async fn on_headers(self, io: Io, dec: Decoder, fr: Frame, handler: Handler | none) throws (HttpError) {
+        let sid = fr.sid;
+        if sid == 0u32 { throw conn_err(PROTOCOL_ERROR, "HEADERS on stream 0"); }
+        let p = try frame::unpad(fr);
+        if fr.has(frame::PRIORITY_FLAG) {
+            if p.len() < 5 { throw conn_err(FRAME_SIZE_ERROR, "HEADERS priority fields"); }
+            p = p[5:p.len()].to_list();
+        }
+        let limit = self.cfg.max_header_list_size as usize * 2 + 16384;
+        let done = fr.has(frame::END_HEADERS);
+        while !done {
+            let c = match try await frame::read(io, self.cfg.max_frame_size, none) {
+                x: Frame => x,
+                none => throw closed_err("connection closed in a header block"),
+            };
+            if c.typ != frame::CONTINUATION || c.sid != sid { throw conn_err(PROTOCOL_ERROR, "header block interrupted"); }
+            p.extend(c.payload);
+            if p.len() > limit { throw conn_err(ENHANCE_YOUR_CALM, "header block too large"); }
+            done = c.has(frame::END_HEADERS);
+        }
+        let fields = try dec.decode(p, self.cfg.max_header_list_size as usize) catch e: HttpError {
+            throw conn_err(if e.kind == ErrorKind::TooLarge { ENHANCE_YOUR_CALM } else { COMPRESSION_ERROR }, e.message);
+        };
+        let end = fr.has(frame::END_STREAM);
+        match handler {
+            h: Handler => try self.on_request(sid, fields, end, h),
+            none => try self.on_response(sid, fields, end),
+        }
+    }
+
+    // ---- server ----
+
+    fn on_request(self, sid: u32, fields: List<(str, str)>, end: bool, handler: Handler) throws (HttpError) {
+        if sid % 2u32 == 0u32 { throw conn_err(PROTOCOL_ERROR, "even stream id from a client"); }
+        if let si: StreamIn = self.stream(sid) {
+            if si.remote_done {
+                self.reset(sid, STREAM_CLOSED);
+                return;
+            }
+            // Trailers.
+            if !end { throw conn_err(PROTOCOL_ERROR, "trailers without END_STREAM"); }
+            if let b: Sender<Chunk> = si.body { b.close(); }
+            self.finish(sid, false);
+            return;
+        }
+        let refuse = false;
+        let fresh = true;
+        using g = self.st.lock() {
+            let st = g.get();
+            if sid <= st.last_peer {
+                fresh = false;
+            } else {
+                st.last_peer = sid;
+                refuse = st.draining || st.streams.len() >= self.cfg.max_concurrent_streams as usize;
+                g.set(st);
+            }
+        }
+        if !fresh { throw conn_err(STREAM_CLOSED, "HEADERS on a closed stream"); }
+        if refuse {
+            self.raw(frame::rst(sid, REFUSED_STREAM));
+            return;
+        }
+        let req = try build_request(fields) catch _ {
+            self.raw(frame::rst(sid, PROTOCOL_ERROR));
+            return;
+        };
+        let len: u64 | none = try h1_content_length(req.headers) catch _ {
+            self.raw(frame::rst(sid, PROTOCOL_ERROR));
+            return;
+        };
+        if end && (len ?? 0u64) != 0u64 {
+            self.raw(frame::rst(sid, PROTOCOL_ERROR));
+            return;
+        }
+        let si = StreamIn { window: self.cfg.initial_window_size as i64, expect: len, remote_done: end };
+        if !end {
+            let (tx, rx) = channel::<Chunk>();
+            si.body = tx;
+            req.body = Body::pulled(rx, self.credit, sid, len);
+        }
+        self.put(sid, si);
+        self.cmd(Cmd::Open(sid));
+        if let pv: str = req.headers.get("priority") { self.cmd(Cmd::Priority(sid, frame::parse_priority(pv))); }
+        let me = self;
+        spawn_with(req, async |r: Request| {
+            await me.respond(sid, handler, r);
+            0
+        });
+    }
+
+    async fn respond(self, sid: u32, handler: Handler, req: Request) {
+        let method = req.method;
+        let resp = await handler(req);
+        if self.stream(sid) is none { return; }
+        let fields = response_fields(resp, method);
+        let code = resp.status.as_u16();
+        let no_body = method == Method::HEAD || code == 204u16 || code == 304u16 || resp.body.is_empty();
+        self.cmd(Cmd::Headers(sid, fields, no_body));
+        if !no_body { await self.send_body(sid, resp.body); }
+        self.finish(sid, true);
+        // The request body was not read to the end: tell the client to
+        // stop sending (8.1).
+        if let si: StreamIn = self.stream(sid) {
+            if !si.remote_done { self.reset(sid, NO_ERROR); }
+        }
+    }
+
+    /// Queue `body` as DATA, one chunk in flight at a time.
+    async fn send_body(self, sid: u32, body: Body) {
+        let (atx, arx) = channel::<i32>();
+        loop {
+            let c = try await body.chunk() catch _ {
+                self.reset(sid, INTERNAL_ERROR);
+                return;
+            };
+            match c {
+                b: List<u8> => {
+                    self.cmd(Cmd::Data(sid, b, false, atx));
+                    if (await arx.recv_async() ?? -1) != 0 { return; }
+                },
+                none => {
+                    self.cmd(Cmd::Data(sid, List::new(), true, none));
+                    return;
+                },
+            }
+        }
+    }
+
+    // ---- client ----
+
+    fn on_response(self, sid: u32, fields: List<(str, str)>, end: bool) throws (HttpError) {
+        let si = match self.stream(sid) {
+            x: StreamIn => x,
+            none => {
+                if self.is_idle(sid) { throw conn_err(PROTOCOL_ERROR, "HEADERS on an idle stream"); }
+                return;
+            },
+        };
+        let waiter = match si.head {
+            h: Sender<Response | HttpError> => h,
+            none => {
+                // Trailers.
+                if !end { throw conn_err(PROTOCOL_ERROR, "trailers without END_STREAM"); }
+                if let b: Sender<Chunk> = si.body { b.close(); }
+                self.finish(sid, false);
+                return;
+            },
+        };
+        let resp = try parse_response(fields) catch _ {
+            self.reset(sid, PROTOCOL_ERROR);
+            return;
+        };
+        let code = resp.status.as_u16();
+        if code < 200u16 {
+            if end { self.reset(sid, PROTOCOL_ERROR); }
+            return;
+        }
+        let len: u64 | none = try h1_content_length(resp.headers) catch _ {
+            self.reset(sid, PROTOCOL_ERROR);
+            return;
+        };
+        si.head = none;
+        let no_body = end || si.method_head || code == 204u16 || code == 304u16;
+        if !no_body {
+            let (tx, rx) = channel::<Chunk>();
+            si.body = tx;
+            si.expect = len;
+            resp.body = Body::pulled(rx, self.credit, sid, len);
+        }
+        self.put(sid, si);
+        try? waiter.send(resp);
+        if end { self.finish(sid, false); }
+    }
+}
+
+/// The Content-Length of HTTP/2 fields, checked.
+fn h1_content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
+    let all = h.get_all("content-length");
+    if all.is_empty() { return none; }
+    if all.len() > 1 { throw conn_err(PROTOCOL_ERROR, "repeated content-length"); }
+    let s = all[0];
+    if s.is_empty() || s.len() > 18 { throw conn_err(PROTOCOL_ERROR, "invalid content-length"); }
+    let n = 0u64;
+    for b in s.bytes() {
+        if b < 0x30u8 || b > 0x39u8 { throw conn_err(PROTOCOL_ERROR, "invalid content-length"); }
+        n = n * 10u64 + (b - 0x30u8) as u64;
+    }
+    n
+}
+
+/// Fields that only mean something on an HTTP/1.1 connection (8.2.2).
+fn connection_specific(n: str) -> bool {
+    n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "transfer-encoding" || n == "upgrade"
+}
+
+/// A valid field (8.2.1): lowercase token name, value without NUL / CR
+/// / LF or surrounding whitespace.
+fn valid_field(n: str, v: str) -> bool {
+    let name = if n.starts_with(":") { n[1:] } else { n };
+    if name.is_empty() { return false; }
+    for b in name.bytes() {
+        if !is_tchar(b) || b >= 0x41u8 && b <= 0x5Au8 { return false; }
+    }
+    for b in v.bytes() {
+        if b == 0u8 || b == 0x0Au8 || b == 0x0Du8 { return false; }
+    }
+    let vb = v.as_bytes();
+    if vb.len() > 0 {
+        let f = vb[0];
+        let l = vb[vb.len() - 1];
+        if f == 0x20u8 || f == 0x09u8 || l == 0x20u8 || l == 0x09u8 { return false; }
+    }
+    true
+}
+
+/// A request from its fields (8.3); throws if malformed.
+fn build_request(fields: List<(str, str)>) throws (HttpError) -> Request {
+    let method: str | none = none;
+    let scheme: str | none = none;
+    let authority: str | none = none;
+    let path: str | none = none;
+    let h = HeaderMap::new();
+    let cookies: List<str> = List::new();
+    let seen: List<str> = List::new();
+    let regular = false;
+    for (n, v) in fields {
+        if !valid_field(n, v) { throw conn_err(PROTOCOL_ERROR, f"invalid field {n:?}"); }
+        if n.starts_with(":") {
+            if regular { throw conn_err(PROTOCOL_ERROR, "pseudo-header after regular field"); }
+            // A repeated pseudo-header is malformed.
+            if seen.iter().any(|x| x == n) { throw conn_err(PROTOCOL_ERROR, f"repeated pseudo-header {n}"); }
+            seen.push(n);
+            if n == ":method" {
+                method = v;
+            } else if n == ":scheme" {
+                scheme = v;
+            } else if n == ":authority" {
+                authority = v;
+            } else if n == ":path" {
+                path = v;
+            } else {
+                throw conn_err(PROTOCOL_ERROR, f"unexpected pseudo-header {n}");
+            }
+            continue;
+        }
+        regular = true;
+        if connection_specific(n) || n == "te" && v != "trailers" { throw conn_err(PROTOCOL_ERROR, f"connection-specific field {n}"); }
+        if n == "cookie" { cookies.push(v); } else { h.append(n, v); }
+    }
+    // 8.2.3: cookie fields are joined for an HTTP/1.1 view.
+    if !cookies.is_empty() { h.append("cookie", cookies.join("; ")); }
+    let m = try Method::parse(method ?? "") catch _ { throw conn_err(PROTOCOL_ERROR, "missing or invalid :method"); };
+    let u = Uri {};
+    if m == Method::CONNECT {
+        if scheme is str || path is str || authority is none { throw conn_err(PROTOCOL_ERROR, "malformed CONNECT"); }
+    } else {
+        let p = path ?? "";
+        if scheme is none || p.is_empty() { throw conn_err(PROTOCOL_ERROR, "missing :scheme or :path"); }
+        if p == "*" {
+            u.path = "*";
+        } else {
+            if !p.starts_with("/") { throw conn_err(PROTOCOL_ERROR, "invalid :path"); }
+            u = try Uri::parse(p) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :path"); };
+            if u.fragment is str { throw conn_err(PROTOCOL_ERROR, "fragment in :path"); }
+        }
+        u.scheme = scheme ?? "";
+    }
+    let a = authority ?? (h.get("host") ?? "");
+    if !a.is_empty() {
+        let au = try Uri::parse("//" + a) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :authority"); };
+        if au.userinfo is str || !au.path.is_empty() || au.query is str { throw conn_err(PROTOCOL_ERROR, "invalid :authority"); }
+        u.host = au.host;
+        u.port = au.port;
+    }
+    Request { method: m, uri: u, version: Version::Http2, headers: h, body: Body::empty() }
+}
+
+fn response_fields(resp: Response, method: Method) -> List<(str, str)> {
+    let h = resp.headers;
+    let ok = true;
+    try h.validate() catch _ { ok = false; };
+    let code = resp.status.as_u16();
+    let out: List<(str, str)> = [(":status", f"{code}")];
+    if !ok {
+        out[0] = (":status", "500");
+        out.push(("content-length", "0"));
+        return out;
+    }
+    for (n, v) in h.entries() {
+        if !connection_specific(n) && n != "te" { out.push((n, v)); }
+    }
+    if !h.contains("date") { out.push(("date", h1::date_now())); }
+    if !h.contains("content-length") && code != 204u16 && code != 304u16 {
+        if let n: u64 = resp.body.len() { out.push(("content-length", f"{n}")); }
+    }
+    out
+}
+
+fn parse_response(fields: List<(str, str)>) throws (HttpError) -> Response {
+    let status: str | none = none;
+    let h = HeaderMap::new();
+    let regular = false;
+    for (n, v) in fields {
+        if !valid_field(n, v) { throw conn_err(PROTOCOL_ERROR, f"invalid field {n:?}"); }
+        if n.starts_with(":") {
+            if regular || n != ":status" || status is str { throw conn_err(PROTOCOL_ERROR, "invalid pseudo-header"); }
+            status = v;
+            continue;
+        }
+        regular = true;
+        if connection_specific(n) { throw conn_err(PROTOCOL_ERROR, f"connection-specific field {n}"); }
+        h.append(n, v);
+    }
+    let s = status ?? { throw conn_err(PROTOCOL_ERROR, "missing :status"); };
+    let b = s.as_bytes();
+    if b.len() != 3 { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }
+    let code = 0u16;
+    for x in b {
+        if x < 0x30u8 || x > 0x39u8 { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }
+        code = code * 10u16 + (x - 0x30u8) as u16;
+    }
+    Response { status: try StatusCode::new(code) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }, version: Version::Http2, headers: h, body: Body::empty() }
+}
+
+// ---- entry points ----
+
+/// Serve one connection whose client preface is buffered in `io`.
+/// `drain`: a message starts a graceful shutdown.
+pub(pkg) async fn serve_conn(io: Io, handler: Handler, cfg: Config, drain: Receiver<i32>) {
+    io.consume(frame::PREFACE.len());
+    let sh = Shared::new(io.wire(), cfg, true);
+    task::spawn(async {
+        if await drain.recv_async() is i32 { sh.drain(); }
+        0
+    });
+    await sh.read_loop(io, handler);
+}
+
+/// The client side of an HTTP/2 connection. Copies share it.
+pub(pkg) struct ClientConn {
+    sh: Shared;
+}
+
+impl ClientConn {
+    /// Send the preface and settings over `io` and start reading.
+    pub async fn start(io: Io, cfg: Config, deadline: Instant | none) throws (HttpError) -> ClientConn {
+        try await io.write(frame::PREFACE.as_bytes(), deadline);
+        let sh = Shared::new(io.wire(), cfg, false);
+        spawn_with(io, async |c: Io| {
+            await sh.read_loop(c, none);
+            c.close();
+            0
+        });
+        ClientConn { sh: sh }
+    }
+
+    /// Whether new requests may go on this connection.
+    pub fn usable(self) -> bool {
+        let st = self.sh.snapshot();
+        !st.closed && st.goaway is none && st.next_id < 0x7FFFFFF0u32
+    }
+
+    pub async fn send(self, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+        let sh = self.sh;
+        try req.headers.validate();
+        let u = req.uri;
+        let fields: List<(str, str)> = [(":method", req.method.as_str())];
+        let auth = req.headers.get("host") ?? u.authority();
+        if req.method == Method::CONNECT {
+            fields.push((":authority", auth));
+        } else {
+            fields.push((":scheme", u.scheme));
+            fields.push((":authority", auth));
+            fields.push((":path", u.path_and_query()));
+        }
+        for (n, v) in req.headers.entries() {
+            if !connection_specific(n) && n != "host" && n != "te" { fields.push((n, v)); }
+        }
+        if !req.headers.contains("user-agent") { fields.push(("user-agent", "rok-http/0.1")); }
+        let body = req.body;
+        let empty = body.is_empty();
+        if !empty && !req.headers.contains("content-length") {
+            if let n: u64 = body.len() { fields.push(("content-length", f"{n}")); }
+        }
+        // Wait for room under the peer's stream limit.
+        let sid = 0u32;
+        let (htx, hrx) = channel::<Response | HttpError>();
+        loop {
+            let full = false;
+            let dead = false;
+            using g = sh.st.lock() {
+                let st = g.get();
+                if st.closed || st.goaway is u32 {
+                    dead = true;
+                } else if st.streams.len() >= st.peer_max as usize {
+                    full = true;
+                } else {
+                    sid = st.next_id;
+                    st.next_id = sid + 2u32;
+                    st.streams.insert(sid, StreamIn { head: htx, method_head: req.method == Method::HEAD, window: sh.cfg.initial_window_size as i64, local_done: empty });
+                    g.set(st);
+                    // Under the lock: header blocks go out in stream id order.
+                    sh.cmd(Cmd::Headers(sid, fields, empty));
+                }
+            }
+            if dead { throw closed_err(pkg::client::STALE); }
+            if !full { break; }
+            if let d: Instant = deadline {
+                if Instant::now() >= d { throw pkg::conn::timed_out("waiting for a stream"); }
+            }
+            // Polls: streams finish on their own schedule.
+            await task::sleep(Duration::ms(5));
+        }
+        if !empty {
+            spawn_with(body, async |b: Body| {
+                await sh.send_body(sid, b);
+                sh.finish(sid, true);
+                0
+            });
+        }
+        let limit: Duration | none = match deadline {
+            d: Instant => left(d),
+            none => none,
+        };
+        match await recv_within(hrx, limit) {
+            r: Response => r,
+            e: HttpError => throw e,
+            none => {
+                sh.reset(sid, CANCEL);
+                throw pkg::conn::timed_out("response");
+            },
+        }
+    }
+}

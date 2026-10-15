@@ -78,6 +78,10 @@ pub(pkg) struct Wire {
 /// TLS over `io` (fresh, nothing read yet), handshake done before
 /// `deadline`.
 pub(pkg) async fn start_tls(io: Io, side: Side, deadline: Instant | none) throws (HttpError) -> Io {
+    if !cfg!(feature = "tls") {
+        io.close();
+        throw HttpError::new(ErrorKind::Unsupported, "TLS needs the `tls` feature");
+    }
     let l = try await pkg::tls::start(io.s, side) catch e: IoError {
         io.close();
         throw io_err(e);

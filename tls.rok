@@ -21,6 +21,7 @@ use rok::std::net::{TcpStream, Shutdown};
 use rok::std::net::tls;
 use rok::std::io::{IoError, byte_buf};
 
+#[cfg(feature = "tls")]
 const APPLICATION_DATA: u8 = 0x17u8;
 /// Header, content type and AEAD tag of a TLS 1.3 record.
 const OVERHEAD: usize = 22;
@@ -47,6 +48,7 @@ pub(pkg) enum Side {
     Server(tls::ServerConfig),
 }
 
+#[cfg(feature = "tls")]
 struct Setup {
     sock: TcpStream;
     side: Side;
@@ -92,6 +94,7 @@ impl Link {
     }
 }
 
+#[cfg(feature = "tls")]
 /// A connected loopback pair. The accepted end is checked against the
 /// connecting one, so another local process cannot take its place.
 async fn pair() throws (IoError) -> (TcpStream, TcpStream) {
@@ -106,6 +109,7 @@ async fn pair() throws (IoError) -> (TcpStream, TcpStream) {
     }
 }
 
+#[cfg(feature = "tls")]
 /// Start TLS over `real`: handshake as `side`, then serve reads and
 /// writes. The first `In` is `Ready` or `Failed`.
 pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link {
@@ -136,8 +140,12 @@ pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link {
     l
 }
 
+#[cfg(not(feature = "tls"))]
+pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link { panic("TLS needs the `tls` feature") }
+
 // ---- the TLS thread ----
 
+#[cfg(feature = "tls")]
 fn tls_read(c: tls::Client | tls::Server, buf: List<u8>) throws (IoError) -> usize {
     match c {
         x: tls::Client => try x.read(buf),
@@ -145,6 +153,7 @@ fn tls_read(c: tls::Client | tls::Server, buf: List<u8>) throws (IoError) -> usi
     }
 }
 
+#[cfg(feature = "tls")]
 fn tls_write(c: tls::Client | tls::Server, data: List<u8>) throws (IoError) {
     match c {
         x: tls::Client => try x.write_all(data),
@@ -152,6 +161,7 @@ fn tls_write(c: tls::Client | tls::Server, data: List<u8>) throws (IoError) {
     }
 }
 
+#[cfg(feature = "tls")]
 fn tls_close(c: tls::Client | tls::Server) {
     match c {
         x: tls::Client => x.close(),
@@ -159,6 +169,7 @@ fn tls_close(c: tls::Client | tls::Server) {
     }
 }
 
+#[cfg(feature = "tls")]
 fn run(s: Setup) {
     let out = s.out;
     let c: tls::Client | tls::Server = try {
@@ -216,6 +227,7 @@ fn run(s: Setup) {
 
 // ---- pumps ----
 
+#[cfg(feature = "tls")]
 /// Network to the TLS thread, a whole record at a time. Records after
 /// the handshake are announced to `l`'s reader; a server's handshake
 /// ends with the client's first encrypted record (its Finished).
@@ -249,6 +261,7 @@ async fn inbound(real: TcpStream, pipe: TcpStream, l: Link, arrived: Sender<i32>
     arrived.close();
 }
 
+#[cfg(feature = "tls")]
 /// TLS thread to the network. A client's handshake ends with its first
 /// encrypted record: from then on the server's records are application
 /// data, and none of them can arrive before that record leaves.

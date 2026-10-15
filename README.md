@@ -15,6 +15,10 @@ Package {
 }
 ```
 
+### Features
+
+`http1`, `http2` and `tls`, all on by default. Turn off what you do not need (`deps: { "http": Dep::version("0.1", default_features: false, features: ["http1"]) }`): a protocol that is off fails with `ErrorKind::Unsupported` at run time, ALPN offers only the protocols that are on, and without `tls` there are no `Client::with_tls`, `Server::bind_tls` or `serve_tls`.
+
 ### Client
 
 ```rok
