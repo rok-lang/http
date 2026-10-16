@@ -53,6 +53,17 @@ struct State {
     conn_unacked: i64 = 0i64;
 }
 
+/// Scalar fields of `State`, copied under the lock.
+struct Snap {
+    next_id: u32;
+    last_peer: u32;
+    goaway: u32 | none;
+    closed: bool;
+    draining: bool;
+    /// No open streams.
+    idle: bool;
+}
+
 /// A connection's shared side. Copies share it.
 pub(pkg) struct Shared {
     st: Mutex<State>;
@@ -122,9 +133,12 @@ impl Shared {
         if self.server { sid % 2u32 == 0u32 || sid > st.last_peer } else { sid % 2u32 == 0u32 || sid >= st.next_id }
     }
 
-    fn snapshot(self) -> State {
-        let s = State { streams: Dict::new() };
-        using g = self.st.lock() { s = g.get(); }
+    fn snapshot(self) -> Snap {
+        let s = Snap { next_id: 0u32, last_peer: 0u32, goaway: none, closed: true, draining: false, idle: true };
+        using g = self.st.lock() {
+            let st = g.get();
+            s = Snap { next_id: st.next_id, last_peer: st.last_peer, goaway: st.goaway, closed: st.closed, draining: st.draining, idle: st.streams.is_empty() };
+        }
         s
     }
 
@@ -170,7 +184,7 @@ impl Shared {
     /// While draining, close once the last stream is done.
     fn check_drained(self) {
         let st = self.snapshot();
-        if st.draining && st.streams.is_empty() { self.cmd(Cmd::Close); }
+        if st.draining && st.idle { self.cmd(Cmd::Close); }
     }
 
     /// Stop accepting streams: GOAWAY with the last stream we took.
@@ -257,7 +271,7 @@ impl Shared {
         let cfg = self.cfg;
         loop {
             let idle: Instant | none = none;
-            if self.server && self.snapshot().streams.is_empty() { idle = deadline_in(cfg.idle_timeout); }
+            if self.server && self.snapshot().idle { idle = deadline_in(cfg.idle_timeout); }
             let f = try await frame::read(io, cfg.max_frame_size, idle) catch e: HttpError {
                 if e.kind == ErrorKind::Timeout { return; }
                 throw e;
