@@ -82,7 +82,8 @@ Over TLS (`use rok::std::net::tls;`); ALPN selects HTTP/2 or HTTP/1.1 per connec
 ```rok
 let chain = try tls::Certificate::from_pem(try fs::read_to_str("cert.pem"));
 let key = try tls::PrivateKey::from_pem(try fs::read_to_str("key.pem"));
-try await http::serve_tls("0.0.0.0:8443", tls::ServerConfig::new(chain, key), handle);
+let cfg = try tls::ServerConfig::new(chain, key);
+try await http::serve_tls("0.0.0.0:8443", cfg, handle);
 ```
 
 With settings and graceful shutdown:

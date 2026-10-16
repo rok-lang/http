@@ -15,7 +15,7 @@ use sup::h1::test_handler;
 
 fn server_tls(leaf: str = "") -> tls::ServerConfig {
     let chain = try! tls::Certificate::from_pem(try! fs::read_to_str(f"tests/tls/{leaf}cert.pem"));
-    tls::ServerConfig::new(chain, try! tls::PrivateKey::from_pem(try! fs::read_to_str(f"tests/tls/{leaf}key.pem")))
+    try! tls::ServerConfig::new(chain, try! tls::PrivateKey::from_pem(try! fs::read_to_str(f"tests/tls/{leaf}key.pem")))
 }
 
 fn client_tls() -> tls::ClientConfig {
