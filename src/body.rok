@@ -25,7 +25,8 @@ impl Body {
     pub fn from_bytes(data: List<u8>) -> Body {
         if data.is_empty() { return Body::empty(); }
         let (tx, rx) = channel::<Chunk>();
-        try! tx.send(data);
+        // The reader owns what it receives; `full` stays ours for resends.
+        try! tx.send(data.clone());
         tx.close();
         Body { rx: rx, len: data.len() as u64, full: data }
     }
