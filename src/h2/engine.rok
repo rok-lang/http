@@ -121,12 +121,6 @@ impl Shared {
         using g = self.st.lock() { g.get().streams.insert(sid, si); }
     }
 
-    fn closed(self) -> bool {
-        let c = true;
-        using g = self.st.lock() { c = g.get().closed; }
-        c
-    }
-
     /// Whether `sid` was never opened (5.1: frames on idle streams).
     fn is_idle(self, sid: u32) -> bool {
         let st = self.snapshot();
@@ -536,7 +530,7 @@ impl Shared {
         let method = req.method;
         let resp = await handler(req);
         if self.stream(sid) is none { return; }
-        let fields = response_fields(resp, method);
+        let fields = response_fields(resp);
         let code = resp.status.as_u16();
         let no_body = method == Method::HEAD || code == 204u16 || code == 304u16 || resp.body.is_empty();
         self.cmd(Cmd::Headers(sid, fields, no_body));
@@ -719,7 +713,7 @@ fn build_request(fields: List<(str, str)>) throws (HttpError) -> Request {
     Request { method: m, uri: u, version: Version::Http2, headers: h, body: Body::empty() }
 }
 
-fn response_fields(resp: Response, method: Method) -> List<(str, str)> {
+fn response_fields(resp: Response) -> List<(str, str)> {
     let h = resp.headers;
     let ok = true;
     try h.validate() catch _ { ok = false; };

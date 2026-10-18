@@ -8,7 +8,7 @@
 // never together with Content-Length or in HTTP/1.0.
 
 use pkg::body::Chunk;
-use pkg::conn::{Io, deadline_in, left};
+use pkg::conn::{Io, deadline_in};
 use pkg::error::{HttpError, ErrorKind};
 use pkg::headers::{HeaderMap, is_token, is_field_value};
 use pkg::message::Version;

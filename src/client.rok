@@ -14,7 +14,6 @@ use pkg::headers::HeaderMap;
 use pkg::message::{Request, Response, Version};
 use pkg::method::Method;
 use pkg::status::StatusCode;
-use pkg::uri::Uri;
 
 /// Client settings. Every field has a default.
 #[derive(Clone)]
