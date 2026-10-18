@@ -81,6 +81,15 @@ impl Client {
         let r = req;
         let hops = 0u32;
         loop {
+            // What a redirect needs, kept apart: `r` goes to the connection.
+            let uri = r.uri;
+            let method = r.method;
+            let headers = r.headers.clone();
+            let empty = r.body.is_empty();
+            let again: List<u8> | none = match r.body.replayable() {
+                b: List<u8> => b.clone(),
+                none => none,
+            };
             let resp = try await self.send_once(r);
             let code = resp.status.as_u16();
             let redirect = code == 301u16 || code == 302u16 || code == 303u16 || code == 307u16 || code == 308u16;
@@ -90,21 +99,21 @@ impl Client {
                 none => return resp,
             };
             if hops >= self.cfg.max_redirects { throw HttpError::new(ErrorKind::Redirect, f"more than {hops} redirects"); }
-            let next = try r.uri.join(loc) catch _ { throw HttpError::new(ErrorKind::Redirect, f"invalid Location {loc:?}"); };
-            next.fragment = r.uri.fragment;
-            let to_get = code == 303u16 && r.method != Method::HEAD || (code == 301u16 || code == 302u16) && r.method == Method::POST;
-            let n = Request::new(if to_get { Method::GET } else { r.method }, next);
-            n.headers = r.headers.clone();
+            let next = try uri.join(loc) catch _ { throw HttpError::new(ErrorKind::Redirect, f"invalid Location {loc:?}"); };
+            next.fragment = uri.fragment;
+            let to_get = code == 303u16 && method != Method::HEAD || (code == 301u16 || code == 302u16) && method == Method::POST;
+            let n = Request::new(if to_get { Method::GET } else { method }, next);
+            n.headers = headers;
             if to_get {
                 n.headers.remove("content-type");
                 n.headers.remove("content-length");
-            } else if !r.body.is_empty() {
-                match r.body.replayable() {
+            } else if !empty {
+                match again {
                     b: List<u8> => { n.body = Body::from_bytes(b); },
                     none => return resp,
                 }
             }
-            if next.scheme != r.uri.scheme || next.authority() != r.uri.authority() {
+            if next.scheme != uri.scheme || next.authority() != uri.authority() {
                 n.headers.remove("authorization");
                 n.headers.remove("proxy-authorization");
                 n.headers.remove("cookie");
@@ -127,13 +136,16 @@ impl Client {
         let key = f"{u.scheme}://{u.authority()}";
         let deadline = deadline_in(self.cfg.timeout);
         let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
-        if let r: Response = try await self.on_h2(key, secure, host, port, req, deadline) { return r; }
+        if self.h2_ready(key) { return try await self.on_h2(key, secure, host, port, req, deadline); }
         if let io: Io = self.checkout(key) {
+            let spare = spare_of(req);
+            // On an error `h1_exchange` closed `io`.
             let r = try await self.h1_exchange(io, key, req, deadline) catch e: HttpError {
-                io.close();
                 if !(replayable && (e.kind == ErrorKind::Io || e.message == STALE)) { throw e; }
-                if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
-                return try await self.fresh(key, secure, host, port, req, deadline);
+                match spare {
+                    s: Request => return try await self.fresh(key, secure, host, port, s, deadline),
+                    none => throw e,
+                }
             };
             return r;
         }
@@ -156,25 +168,44 @@ impl Client {
         try await self.h1_exchange(io, key, req, deadline)
     }
 
-    /// `req` on the pooled HTTP/2 connection to `key`, if there is one.
+    /// A usable pooled HTTP/2 connection to `key` is there.
     #[cfg(feature = "http2")]
-    async fn on_h2(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response | none {
+    fn h2_ready(self, key: str) -> bool {
+        let ready = false;
+        using g = self.h2.lock() {
+            if let c: h2::ClientConn = g.get().get(key) { ready = c.usable(); }
+        }
+        ready
+    }
+
+    #[cfg(not(feature = "http2"))]
+    fn h2_ready(self, key: str) -> bool { false }
+
+    /// `req` on the pooled HTTP/2 connection to `key` (a new connection
+    /// when it went away meanwhile).
+    #[cfg(feature = "http2")]
+    async fn on_h2(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
         let found: h2::ClientConn | none = none;
         using g = self.h2.lock() { found = g.get().get(key); }
-        let c = found ?? { return none; };
-        if !c.usable() { return none; }
+        let c = found ?? { return try await self.fresh(key, secure, host, port, req, deadline); };
+        if !c.usable() { return try await self.fresh(key, secure, host, port, req, deadline); }
         let replayable = req.body.is_empty() || req.body.replayable() is List<u8>;
+        let spare = spare_of(req);
         let r = try await c.send(req, deadline) catch e: HttpError {
             if !(replayable && e.message == STALE) { throw e; }
             // Refused by GOAWAY or a closed connection: once more on a new one.
-            if let b: List<u8> = req.body.replayable() { req.body = Body::from_bytes(b); }
-            return try await self.fresh(key, secure, host, port, req, deadline);
+            match spare {
+                s: Request => return try await self.fresh(key, secure, host, port, s, deadline),
+                none => throw e,
+            }
         };
         r
     }
 
     #[cfg(not(feature = "http2"))]
-    async fn on_h2(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response | none { none }
+    async fn on_h2(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+        try await self.fresh(key, secure, host, port, req, deadline)
+    }
 
     #[cfg(feature = "http2")]
     async fn start_h2(self, io: Io, key: str, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
@@ -236,8 +267,43 @@ impl Client {
         throw HttpError::new(ErrorKind::Unsupported, "HTTP/1.1 needs the `http1` feature");
     }
 
+    /// `req` over `io`, the response streamed from it; `io` is closed on
+    /// an error.
     #[cfg(feature = "http1")]
     async fn h1_exchange(self, io: Io, key: str, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+        let cfg = self.cfg;
+        let (resp, fr, reusable) = try await self.h1_head(io, req, deadline) catch e: HttpError {
+            io.close();
+            throw e;
+        };
+        match fr {
+            Framing::Empty => {
+                if reusable { self.checkin(key, io); } else { io.close(); }
+                return resp;
+            },
+            _ => {},
+        }
+        let len: u64 | none = match fr {
+            Framing::Length(n) => n,
+            _ => none,
+        };
+        let (tx, rx) = channel::<Chunk>();
+        let (ctx, crx) = channel::<(u32, usize)>();
+        resp.body = Body::pulled(rx, ctx, 1u32, len);
+        let me = self;
+        let opts = PumpOpts { read_timeout: cfg.read_timeout, want_timeout: cfg.idle_timeout };
+        spawn_with(io, async |c: Io| {
+            let p = await h1::pump(c, fr, tx, crx, opts);
+            if p == Pumped::Complete && reusable { me.checkin(key, c); } else { c.close(); }
+            0
+        });
+        resp
+    }
+
+    /// Write `req` to `io` and read the response head: the response
+    /// (no body yet), its framing and whether `io` can be reused.
+    #[cfg(feature = "http1")]
+    async fn h1_head(self, io: Io, req: Request, deadline: Instant | none) throws (HttpError) -> (Response, Framing, bool) {
         let cfg = self.cfg;
         try req.headers.validate();
         let u = req.uri;
@@ -310,27 +376,20 @@ impl Client {
             rh.headers.has_token("connection", "keep-alive")
         };
         let resp = Response { status: try StatusCode::new(rh.status), version: rh.version, headers: rh.headers, body: Body::empty() };
-        match fr {
-            Framing::Empty => {
-                if reusable { self.checkin(key, io); } else { io.close(); }
-                return resp;
-            },
-            _ => {},
-        }
-        let len: u64 | none = match fr {
-            Framing::Length(n) => n,
-            _ => none,
-        };
-        let (tx, rx) = channel::<Chunk>();
-        let (ctx, crx) = channel::<(u32, usize)>();
-        resp.body = Body::pulled(rx, ctx, 1u32, len);
-        let me = self;
-        let opts = PumpOpts { read_timeout: cfg.read_timeout, want_timeout: cfg.idle_timeout };
-        spawn_with(io, async |c: Io| {
-            let p = await h1::pump(c, fr, tx, crx, opts);
-            if p == Pumped::Complete && reusable { me.checkin(key, c); } else { c.close(); }
-            0
-        });
-        resp
+        (resp, fr, reusable)
     }
+}
+
+/// A copy of `req` to send again (its own headers and body bytes), or
+/// none when its body cannot be replayed.
+fn spare_of(req: Request) -> Request | none {
+    let body = if req.body.is_empty() {
+        Body::empty()
+    } else {
+        match req.body.replayable() {
+            b: List<u8> => Body::from_bytes(b.clone()),
+            none => return none,
+        }
+    };
+    Request { method: req.method, uri: req.uri, version: req.version, headers: req.headers.clone(), body: body }
 }

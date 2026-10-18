@@ -839,6 +839,8 @@ impl ClientConn {
                     g.set(st);
                     // Under the lock: header blocks go out in stream id order.
                     sh.cmd(Cmd::Headers(sid, fields, empty));
+                    // The writer owns them now; the loop ends here.
+                    fields = [];
                 }
             }
             if dead { throw closed_err(pkg::client::STALE); }
