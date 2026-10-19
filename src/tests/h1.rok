@@ -86,8 +86,6 @@ fn parse_response() {
     expect(h1::http_date(951782400i64) == "Tue, 29 Feb 2000 00:00:00 GMT", "leap day");
 }
 
-// ---- loopback ----
-
 pub(pkg) async fn test_handler(req: Request) -> Response {
     let p = req.uri.path;
     if p == "/echo" {

@@ -91,7 +91,7 @@ impl Table {
     }
 }
 
-// ---- primitives (5.1, 5.2) ----
+// Integer and string primitives (RFC 7541 5.1, 5.2).
 
 /// An integer with an `n`-bit prefix; `flags` fill the high bits of the
 /// first byte.

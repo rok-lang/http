@@ -77,8 +77,6 @@ fn h2_graceful_shutdown() {
     });
 }
 
-// ---- protocol errors on the wire ----
-
 /// `(type, stream, error code)` of each frame the server sent; the code
 /// is that of RST_STREAM / GOAWAY.
 async fn exchange(base: str, frames: List<u8>) -> List<(u8, u32, u32)> {

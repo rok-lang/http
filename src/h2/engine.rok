@@ -239,8 +239,6 @@ impl Shared {
         }
     }
 
-    // ---- reading ----
-
     /// Read frames until the connection ends. `handler`: serve requests
     /// (server); `none`: deliver responses (client).
     async fn read_loop(self, io: Io, handler: Handler | none) {
@@ -466,8 +464,6 @@ impl Shared {
         }
     }
 
-    // ---- server ----
-
     fn on_request(self, sid: u32, fields: List<(str, str)>, end: bool, handler: Handler) throws (HttpError) {
         if sid % 2u32 == 0u32 { throw conn_err(PROTOCOL_ERROR, "even stream id from a client"); }
         if let si: StreamIn = self.stream(sid) {
@@ -563,8 +559,6 @@ impl Shared {
             }
         }
     }
-
-    // ---- client ----
 
     fn on_response(self, sid: u32, fields: List<(str, str)>, end: bool) throws (HttpError) {
         let si = match self.stream(sid) {
@@ -759,8 +753,6 @@ fn parse_response(fields: List<(str, str)>) throws (HttpError) -> Response {
     }
     Response { status: try StatusCode::new(code) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }, version: Version::Http2, headers: h, body: Body::empty() }
 }
-
-// ---- entry points ----
 
 /// Serve one connection whose client preface is buffered in `io`.
 /// `drain`: a message starts a graceful shutdown.
