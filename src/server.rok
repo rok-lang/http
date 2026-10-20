@@ -121,7 +121,11 @@ impl Server {
     }
 
     fn tls_config(self) -> tls::ServerConfig | none {
-        using g = self.tls.lock() { return g.get().first(); }
+        let cfg: tls::ServerConfig | none = none;
+        using g = self.tls.lock() { cfg = g.get().first(); }
+        // Set once by `bind_tls` and never changed: connections only read
+        // it, so sharing it outside the lock is safe.
+        unsafe { cfg }
     }
 
     pub fn local_addr(self) throws (HttpError) -> SocketAddr {

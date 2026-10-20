@@ -221,11 +221,16 @@ impl Client {
     }
 
     fn tls_config(self) -> tls::ClientConfig {
+        let cfg: tls::ClientConfig | none = none;
         using g = self.tls.lock() {
             let l = g.get();
             if l.is_empty() { l.push(tls::ClientConfig::new()); }
-            return l[0];
+            cfg = l[0];
         }
+        // Made once and never changed: connections only read it (its
+        // session cache locks itself), so sharing it outside the lock is
+        // safe.
+        unsafe { cfg ?? tls::ClientConfig::new() }
     }
 
     /// Idle HTTP/1.1 connections pooled for `origin` (`http://host:port`).
