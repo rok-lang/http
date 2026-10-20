@@ -144,7 +144,7 @@ async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>
     }
     // Ends a pending read (closing the descriptor here would leave it
     // waiting), and the reader then ends.
-    try? sock.shutdown(Shutdown::Both);
+    let _ = try? sock.shutdown(Shutdown::Both);
     reads.close();
     while let x: Op = ops.try_recv() {
         if let Op::Write(_, ack) = x { try? ack.send("connection closed"); }

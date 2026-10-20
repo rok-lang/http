@@ -134,7 +134,7 @@ pub(pkg) fn start(cfg: ServerConfig | none = none) -> (Server, str) {
 pub(pkg) async fn raw(base: str, data: str) -> str {
     let s = try! await rok::std::net::tcp_connect_async(base.strip_prefix("http://") ?? base);
     try! await s.write_all_async(data);
-    try! s.shutdown(Shutdown::Write);
+    let _ = try? s.shutdown(Shutdown::Write);
     let back = try! await s.read_to_end_async();
     s.close();
     try! str::from_utf8(back)

@@ -86,7 +86,7 @@ async fn exchange(base: str, frames: List<u8>) -> List<(u8, u32, u32)> {
     try! await s.write_all_async(out);
     // Give the server time to answer before the half-close.
     await task::sleep(Duration::ms(100));
-    try! s.shutdown(Shutdown::Write);
+    let _ = try? s.shutdown(Shutdown::Write);
     let back = try! await s.read_to_end_async();
     s.close();
     let got: List<(u8, u32, u32)> = List::new();

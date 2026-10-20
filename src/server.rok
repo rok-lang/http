@@ -163,7 +163,7 @@ impl Server {
         try? self.stop_tx.send(1);
         using g = self.conns.lock() {
             for e in g.get().values() {
-                if e.idle { try? e.s.shutdown(Shutdown::Both); }
+                if e.idle { let _ = try? e.s.shutdown(Shutdown::Both); }
                 if let d: Sender<i32> = e.drain { try? d.send(1); }
             }
         }
@@ -175,7 +175,7 @@ impl Server {
             if let t: Instant = end {
                 if Instant::now() >= t {
                     using g = self.conns.lock() {
-                        for e in g.get().values() { try? e.s.shutdown(Shutdown::Both); }
+                        for e in g.get().values() { let _ = try? e.s.shutdown(Shutdown::Both); }
                     }
                     break;
                 }

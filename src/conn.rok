@@ -197,7 +197,7 @@ impl Io {
         if let l: Link = self.t {
             try? l.ops.send(Op::Close);
         } else {
-            try? self.s.shutdown(Shutdown::Both);
+            let _ = try? self.s.shutdown(Shutdown::Both);
         }
     }
 
@@ -207,7 +207,7 @@ impl Io {
             try? l.ops.send(Op::Close);
             return;
         }
-        try? self.s.shutdown(Shutdown::Both);
+        let _ = try? self.s.shutdown(Shutdown::Both);
         self.s.close();
     }
 }
