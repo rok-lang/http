@@ -395,42 +395,55 @@ impl Shared {
         }
         if overflow { throw conn_err(FLOW_CONTROL_ERROR, "connection window exceeded"); }
         if ret > 0i64 { self.raw(frame::window_update(0u32, ret as u32)); }
-        let si = match self.stream(sid) {
-            x: StreamIn => x,
-            none => {
-                if self.is_idle(sid) { throw conn_err(PROTOCOL_ERROR, "DATA on an idle stream"); }
-                self.raw(frame::rst(sid, STREAM_CLOSED));
-                return;
-            },
-        };
-        if si.remote_done || si.head is Sender<Response | HttpError> {
-            self.reset(sid, STREAM_CLOSED);
-            return;
-        }
-        if flow > si.window {
-            self.reset(sid, FLOW_CONTROL_ERROR);
-            return;
-        }
-        si.window = si.window - flow;
-        let pad = flow - data.len() as i64;
-        if pad > 0i64 {
-            si.window = si.window + pad;
-            self.raw(frame::window_update(sid, pad as u32));
-        }
-        si.got = si.got + data.len() as u64;
+        // Under the lock: `finish` from the stream's other side changes the
+        // same entry.
         let end = fr.has(frame::END_STREAM);
-        if let e: u64 = si.expect {
-            if si.got > e || end && si.got != e {
-                self.reset(sid, PROTOCOL_ERROR);
-                return;
+        let pad = flow - data.len() as i64;
+        let known = true;
+        let bad = 0u32;
+        let body: Sender<Chunk> | none = none;
+        using g = self.st.lock() {
+            let st = g.get();
+            if let si: StreamIn = st.streams.get(sid) {
+                let over = match si.expect {
+                    e: u64 => si.got + data.len() as u64 > e || end && si.got + data.len() as u64 != e,
+                    none => false,
+                };
+                if si.remote_done || si.head is Sender<Response | HttpError> {
+                    bad = STREAM_CLOSED;
+                } else if flow > si.window {
+                    bad = FLOW_CONTROL_ERROR;
+                } else if over {
+                    bad = PROTOCOL_ERROR;
+                } else {
+                    si.window = si.window - flow + pad;
+                    si.got = si.got + data.len() as u64;
+                    body = si.body;
+                    st.streams.insert(sid, si);
+                }
+            } else {
+                known = false;
             }
         }
-        self.put(sid, si);
-        if let b: Sender<Chunk> = si.body {
+        if !known {
+            if self.is_idle(sid) { throw conn_err(PROTOCOL_ERROR, "DATA on an idle stream"); }
+            self.raw(frame::rst(sid, STREAM_CLOSED));
+            return;
+        }
+        if bad != 0u32 {
+            self.reset(sid, bad);
+            return;
+        }
+        if pad > 0i64 { self.raw(frame::window_update(sid, pad as u32)); }
+        if let b: Sender<Chunk> = body {
             if !data.is_empty() { try? b.send(data); }
+        }
+        // The stream knows its end before the body does: whoever reads the
+        // body to its end may look at the stream next (`respond`).
+        if end { self.finish(sid, false); }
+        if let b: Sender<Chunk> = body {
             if end { b.close(); }
         }
-        if end { self.finish(sid, false); }
     }
 
     /// A header block (HEADERS plus CONTINUATIONs), decoded.
@@ -553,7 +566,10 @@ impl Shared {
                     if (await arx.recv_async() ?? -1) != 0 { return; }
                 },
                 none => {
-                    self.cmd(Cmd::Data(sid, List::new(), true, none));
+                    // Wait for the END_STREAM frame too: a reset after the
+                    // response (`respond`) must follow it, not drop it.
+                    self.cmd(Cmd::Data(sid, List::new(), true, atx));
+                    await arx.recv_async();
                     return;
                 },
             }

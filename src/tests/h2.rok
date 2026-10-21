@@ -64,6 +64,22 @@ fn loopback_h2() {
     });
 }
 
+/// A handler that answers as soon as it has read the request body:
+/// the response's last DATA must still reach the client (8.1).
+#[test]
+fn h2_echo_right_after_body() {
+    task::block_on(async {
+        let (srv, base) = start();
+        let c = h2_client();
+        for i in 0..200 {
+            let e = try! await c.send((try! Request::post(base + "/echo")).text(f"ping {i}"));
+            let t = try! await e.body.text();
+            expect(t == f"ping {i}", t);
+        }
+        await srv.shutdown();
+    });
+}
+
 #[test]
 fn h2_graceful_shutdown() {
     task::block_on(async {
