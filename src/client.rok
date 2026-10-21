@@ -120,7 +120,7 @@ impl Client {
             }
             n.headers.remove("host");
             // Let the connection go back to the pool.
-            try? await resp.body.bytes(65536);
+            let _ = try? await resp.body.bytes(65536);
             r = n;
             hops += 1u32;
         }

@@ -7,7 +7,7 @@ use pkg::h2::frame;
 use pkg::h2::frame::{parse_priority, u32_at};
 use pkg::h2::hpack::Encoder;
 use sup::expect;
-use sup::h1::{start, test_handler};
+use sup::h1::start;
 
 #[test]
 fn priority_fields() {

@@ -60,11 +60,11 @@ impl Body {
             r: Receiver<Chunk> => r,
             none => return none,
         };
-        if let c: Sender<(u32, usize)> = self.credit { try? c.send((self.tag, 0usize)); }
+        if let c: Sender<(u32, usize)> = self.credit { let _ = try? c.send((self.tag, 0usize)); }
         match await rx.recv_async() {
             b: List<u8> => {
                 if let c: Sender<(u32, usize)> = self.credit {
-                    if b.len() > 0 { try? c.send((self.tag, b.len())); }
+                    if b.len() > 0 { let _ = try? c.send((self.tag, b.len())); }
                 }
                 b
             },
@@ -116,7 +116,7 @@ impl BodyWriter {
 
     /// End the body with an error the reader gets.
     pub async fn fail(self, e: HttpError) {
-        try? await self.tx.send_async(e);
+        let _ = try? await self.tx.send_async(e);
         self.tx.close();
     }
 }

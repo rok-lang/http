@@ -140,7 +140,7 @@ impl Server {
             match a {
                 Accepted::Conn(s) => {
                     failures = 0;
-                    try? s.set_nodelay(true);
+                    let _ = try? s.set_nodelay(true);
                     let me = self;
                     task::spawn(async {
                         await me.conn_main(s);
@@ -164,11 +164,11 @@ impl Server {
     /// `grace` the remaining connections are cut.
     pub async fn shutdown(self, grace: Duration | none = Duration::sec(30)) {
         if self.stopping.swap(true) { return; }
-        try? self.stop_tx.send(1);
+        let _ = try? self.stop_tx.send(1);
         using g = self.conns.lock() {
             for e in g.get().values() {
                 if e.idle { let _ = try? e.s.shutdown(Shutdown::Both); }
-                if let d: Sender<i32> = e.drain { try? d.send(1); }
+                if let d: Sender<i32> = e.drain { let _ = try? d.send(1); }
             }
         }
         let end = deadline_in(grace);
@@ -253,7 +253,7 @@ impl Server {
             if !self.mark(id, true) { break; }
             let first = deadline_in(cfg.idle_timeout);
             let block = try await h1::read_block(io, cfg.limits.max_head, first, deadline_in(cfg.header_timeout)) catch e: HttpError {
-                if e.code > 0u32 { try? await write_error(io, e, cfg); }
+                if e.code > 0u32 { let _ = try? await write_error(io, e, cfg); }
                 break;
             };
             let b = match block {
@@ -262,7 +262,7 @@ impl Server {
             };
             self.mark(id, false);
             let keep = try await self.exchange(io, b) catch e: HttpError {
-                if e.code > 0u32 { try? await write_error(io, e, cfg); }
+                if e.code > 0u32 { let _ = try? await write_error(io, e, cfg); }
                 false
             };
             if !keep { break; }
@@ -298,8 +298,8 @@ impl Server {
         let h = self.handler;
         spawn_with(req, async |r: Request| {
             let resp = await h(r);
-            try? rtx.send(resp);
-            try? ctx.send((DONE, 0usize));
+            let _ = try? rtx.send(resp);
+            let _ = try? ctx.send((DONE, 0usize));
             0
         });
         let pumped = await h1::pump(io, fr, tx, crx, PumpOpts { cont: cont, read_timeout: cfg.io_timeout, max: cfg.max_body });

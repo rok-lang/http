@@ -36,7 +36,7 @@ struct Queued {
 }
 
 fn tell(ack: Sender<i32> | none, v: i32) {
-    if let a: Sender<i32> = ack { try? a.send(v); }
+    if let a: Sender<i32> = ack { let _ = try? a.send(v); }
 }
 
 /// Run until `Close` and the channel's end.

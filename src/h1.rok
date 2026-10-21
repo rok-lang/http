@@ -333,7 +333,7 @@ pub(pkg) struct PumpOpts {
 /// closes `tx`: a client pools `io` first, so the next request finds it.
 pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) -> Pumped {
     let r = try await pump_inner(io, fr, tx, credit, opts) catch e: HttpError {
-        try? await tx.send_async(e);
+        let _ = try? await tx.send_async(e);
         tx.close();
         Pumped::Failed
     };

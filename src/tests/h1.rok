@@ -1,7 +1,6 @@
 // HTTP/1.1: head parsing, smuggling cases, loopback client and server.
 
-use rok::std::net::{TcpStream, Shutdown};
-use rok::std::io::IoError;
+use rok::std::net::Shutdown;
 use pkg::*;
 use pkg::h1::{Limits, Framing, parse_request_head, parse_response_head, request_framing, response_framing};
 use sup::expect;
@@ -97,7 +96,7 @@ pub(pkg) async fn test_handler(req: Request) -> Response {
     if p == "/stream" {
         let (w, body) = Body::channel();
         task::spawn(async {
-            for i in 0..50 { try? await w.send_str(f"line {i}\n"); }
+            for i in 0..50 { let _ = try? await w.send_str(f"line {i}\n"); }
             w.finish();
             0
         });

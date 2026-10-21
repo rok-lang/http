@@ -58,7 +58,7 @@ pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | 
         let r: Link | str | IoError = try await run(v.0, v.1) catch e: tls::TlsError {
             if e.kind == tls::TlsErrorKind::Io { IoError::new(e.msg) } else { e.msg }
         };
-        try? tx.send(r);
+        let _ = try? tx.send(r);
         0
     });
     match await rx.recv_async() {
@@ -111,11 +111,11 @@ async fn reader(c: tls::Client | tls::Server, sock: TcpStream, reads: Receiver<i
     let buf = byte_buf(16384);
     while await reads.recv_async() is i32 {
         let n = try await tls_read(c, buf) catch e: IoError {
-            try? out.send(In::Failed(e.message));
+            let _ = try? out.send(In::Failed(e.message));
             break;
         };
         if n == 0 { break; }
-        try? out.send(In::Data(buf[0:n].to_list()));
+        let _ = try? out.send(In::Data(buf[0:n].to_list()));
     }
     out.close();
     sock.close();
@@ -133,7 +133,7 @@ async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>
                     }
                     ""
                 } catch e: IoError { e.message };
-                try? ack.send(r);
+                let _ = try? ack.send(r);
             },
             Op::Close => break,
         }
@@ -147,6 +147,6 @@ async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>
     let _ = try? sock.shutdown(Shutdown::Both);
     reads.close();
     while let x: Op = ops.try_recv() {
-        if let Op::Write(_, ack) = x { try? ack.send("connection closed"); }
+        if let Op::Write(_, ack) = x { let _ = try? ack.send("connection closed"); }
     }
 }

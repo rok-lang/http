@@ -63,7 +63,7 @@ pub(pkg) async fn connect(host: str, port: u16, deadline: Instant | none) throws
         Result::Ok(s) => s,
         Result::Err(e) => throw io_err(e),
     };
-    try? s.set_nodelay(true);
+    let _ = try? s.set_nodelay(true);
     Io::new(s)
 }
 
@@ -195,7 +195,7 @@ impl Io {
     /// Stop both directions: pending reads end. TLS sends close_notify.
     pub fn shutdown(self) {
         if let l: Link = self.t {
-            try? l.ops.send(Op::Close);
+            let _ = try? l.ops.send(Op::Close);
         } else {
             let _ = try? self.s.shutdown(Shutdown::Both);
         }
@@ -204,7 +204,7 @@ impl Io {
     /// End the connection; TLS sends close_notify first.
     pub fn close(self) {
         if let l: Link = self.t {
-            try? l.ops.send(Op::Close);
+            let _ = try? l.ops.send(Op::Close);
             return;
         }
         let _ = try? self.s.shutdown(Shutdown::Both);
