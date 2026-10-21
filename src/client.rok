@@ -300,6 +300,7 @@ impl Client {
         spawn_with(io, async |c: Io| {
             let p = await h1::pump(c, fr, tx, crx, opts);
             if p == Pumped::Complete && reusable { me.checkin(key, c); } else { c.close(); }
+            tx.close();
             0
         });
         resp

@@ -329,7 +329,8 @@ pub(pkg) struct PumpOpts {
 }
 
 /// Feed the body framed by `fr` from `io` to `tx`, one piece per
-/// demand message on `credit` (see `Body`).
+/// demand message on `credit` (see `Body`). After `Complete` the caller
+/// closes `tx`: a client pools `io` first, so the next request finds it.
 pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) -> Pumped {
     let r = try await pump_inner(io, fr, tx, credit, opts) catch e: HttpError {
         try? await tx.send_async(e);
@@ -342,10 +343,7 @@ pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<
 async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) throws (HttpError) -> Pumped {
     let remaining = match fr {
         Framing::Length(n) => n,
-        Framing::Empty => {
-            tx.close();
-            return Pumped::Complete;
-        },
+        Framing::Empty => return Pumped::Complete,
         _ => 0u64,
     };
     let chunk_left = 0u64;
@@ -398,7 +396,6 @@ async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u3
                             trailer += l.len();
                             if trailer > 65536 { throw bad(431u16, "trailers too large"); }
                         }
-                        tx.close();
                         return Pumped::Complete;
                     }
                     chunk_left = size;
@@ -423,10 +420,7 @@ async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u3
         if piece.len() > 0 {
             try await tx.send_async(piece) catch _ { return Pumped::Abandoned; };
         }
-        if last {
-            tx.close();
-            return Pumped::Complete;
-        }
+        if last { return Pumped::Complete; }
     }
 }
 

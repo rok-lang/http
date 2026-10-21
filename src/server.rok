@@ -303,6 +303,7 @@ impl Server {
             0
         });
         let pumped = await h1::pump(io, fr, tx, crx, PumpOpts { cont: cont, read_timeout: cfg.io_timeout, max: cfg.max_body });
+        tx.close();
         if pumped != Pumped::Abandoned {
             loop {
                 match await crx.recv_async() {
