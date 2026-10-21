@@ -58,8 +58,9 @@ pub struct Server {
     conns: Mutex<Dict<u64, ConnEntry>>;
     stop_tx: Sender<i32>;
     stop_rx: Receiver<i32>;
-    /// TLS certificate and key; empty for plaintext.
-    tls: Mutex<List<tls::ServerConfig>>;
+    /// TLS certificate and key, set once by `bind_tls`; empty for
+    /// plaintext.
+    tls: Mutex<List<Frozen<tls::ServerConfig>>>;
 }
 
 /// Serve `handler` on `addr` (`"127.0.0.1:8080"`) until the process
@@ -116,16 +117,15 @@ impl Server {
     /// by the server.
     pub fn bind_tls(addr: str, handler: Handler, tls_cfg: tls::ServerConfig, cfg: ServerConfig | none = none) throws (HttpError) -> Server {
         let s = try Server::bind(addr, handler, cfg);
-        using g = s.tls.lock() { g.get().push(tls_cfg); }
+        using g = s.tls.lock() { g.get().push(Frozen::new(tls_cfg)); }
         s
     }
 
+    /// A connection's own copy of the TLS settings.
     fn tls_config(self) -> tls::ServerConfig | none {
-        let cfg: tls::ServerConfig | none = none;
+        let cfg: Frozen<tls::ServerConfig> | none = none;
         using g = self.tls.lock() { cfg = g.get().first(); }
-        // Set once by `bind_tls` and never changed: connections only read
-        // it, so sharing it outside the lock is safe.
-        unsafe { cfg }
+        cfg?.get()
     }
 
     pub fn local_addr(self) throws (HttpError) -> SocketAddr {

@@ -50,7 +50,7 @@ pub struct Client {
     pool: Mutex<Dict<str, List<Pooled>>>;
     h2: Mutex<Dict<str, h2::ClientConn>> = Mutex::new(Dict::<str, h2::ClientConn>::new());
     /// The TLS settings, made on first use (reading the OS trust store).
-    tls: Mutex<List<tls::ClientConfig>>;
+    tls: Mutex<List<Frozen<tls::ClientConfig>>>;
 }
 
 /// GET `url` with a default client.
@@ -70,7 +70,7 @@ impl Client {
     /// ALPN is set by the client).
     pub fn with_tls(tls_cfg: tls::ClientConfig, cfg: ClientConfig | none = none) -> Client {
         let c = Client::new(cfg);
-        using g = c.tls.lock() { g.get().push(tls_cfg); }
+        using g = c.tls.lock() { g.get().push(Frozen::new(tls_cfg)); }
         c
     }
 
@@ -220,17 +220,16 @@ impl Client {
         throw HttpError::new(ErrorKind::Unsupported, "HTTP/2 needs the `http2` feature");
     }
 
+    /// A connection's own copy of the TLS settings; the session cache
+    /// stays shared (it locks itself).
     fn tls_config(self) -> tls::ClientConfig {
-        let cfg: tls::ClientConfig | none = none;
+        let cfg: Frozen<tls::ClientConfig> | none = none;
         using g = self.tls.lock() {
             let l = g.get();
-            if l.is_empty() { l.push(tls::ClientConfig::new()); }
+            if l.is_empty() { l.push(Frozen::new(tls::ClientConfig::new())); }
             cfg = l[0];
         }
-        // Made once and never changed: connections only read it (its
-        // session cache locks itself), so sharing it outside the lock is
-        // safe.
-        unsafe { cfg ?? tls::ClientConfig::new() }
+        cfg?.get() ?? tls::ClientConfig::new()
     }
 
     /// Idle HTTP/1.1 connections pooled for `origin` (`http://host:port`).
