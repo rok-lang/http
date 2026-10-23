@@ -11,6 +11,8 @@ pub(pkg) mod hpack;
 #[cfg(feature = "http2")]
 mod writer;
 #[cfg(feature = "http2")]
+mod fields;
+#[cfg(feature = "http2")]
 mod engine;
 
 #[cfg(feature = "http2")]

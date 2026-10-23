@@ -7,21 +7,18 @@
 use pkg::body::{Body, Chunk};
 use pkg::conn::{Io, Wire, deadline_in, left, spawn_with};
 use pkg::error::{HttpError, ErrorKind};
-use pkg::h1;
 use pkg::h1::recv_within;
 use pkg::h2::frame::{Frame, conn_err, u32_at};
 use pkg::h2::frame::{PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, CANCEL, INTERNAL_ERROR, NO_ERROR, COMPRESSION_ERROR, ENHANCE_YOUR_CALM};
 use pkg::h2::hpack::Decoder;
 use pkg::h2::writer::Cmd;
-use pkg::headers::{HeaderMap, is_tchar};
-use pkg::message::{Request, Response, Version};
+use pkg::message::{Request, Response};
 use pkg::method::Method;
 use pkg::server::Handler;
-use pkg::status::StatusCode;
-use pkg::uri::Uri;
 use pkg::h2::Config;
 use pkg::h2::writer;
 use pkg::h2::frame;
+use pkg::h2::fields::*;
 
 struct StreamIn {
     /// Where DATA goes; `none` before a body exists or once it ended.
@@ -619,155 +616,6 @@ impl Shared {
         let _ = try? waiter.send(resp);
         if end { self.finish(sid, false); }
     }
-}
-
-/// The Content-Length of HTTP/2 fields, checked.
-fn h1_content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
-    let all = h.get_all("content-length");
-    if all.is_empty() { return none; }
-    if all.len() > 1 { throw conn_err(PROTOCOL_ERROR, "repeated content-length"); }
-    let s = all[0];
-    if s.is_empty() || s.len() > 18 { throw conn_err(PROTOCOL_ERROR, "invalid content-length"); }
-    let n = 0u64;
-    for b in s.bytes() {
-        if b < 0x30u8 || b > 0x39u8 { throw conn_err(PROTOCOL_ERROR, "invalid content-length"); }
-        n = n * 10u64 + (b - 0x30u8) as u64;
-    }
-    n
-}
-
-/// Fields that only mean something on an HTTP/1.1 connection (8.2.2).
-fn connection_specific(n: str) -> bool {
-    n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "transfer-encoding" || n == "upgrade"
-}
-
-/// A valid field (8.2.1): lowercase token name, value without NUL / CR
-/// / LF or surrounding whitespace.
-fn valid_field(n: str, v: str) -> bool {
-    let name = if n.starts_with(":") { n[1:] } else { n };
-    if name.is_empty() { return false; }
-    for b in name.bytes() {
-        if !is_tchar(b) || b >= 0x41u8 && b <= 0x5Au8 { return false; }
-    }
-    for b in v.bytes() {
-        if b == 0u8 || b == 0x0Au8 || b == 0x0Du8 { return false; }
-    }
-    let vb = v.as_bytes();
-    if vb.len() > 0 {
-        let f = vb[0];
-        let l = vb[vb.len() - 1];
-        if f == 0x20u8 || f == 0x09u8 || l == 0x20u8 || l == 0x09u8 { return false; }
-    }
-    true
-}
-
-/// A request from its fields (8.3); throws if malformed.
-fn build_request(fields: List<(str, str)>) throws (HttpError) -> Request {
-    let method: str | none = none;
-    let scheme: str | none = none;
-    let authority: str | none = none;
-    let path: str | none = none;
-    let h = HeaderMap::new();
-    let cookies: List<str> = List::new();
-    let seen: List<str> = List::new();
-    let regular = false;
-    for (n, v) in fields {
-        if !valid_field(n, v) { throw conn_err(PROTOCOL_ERROR, f"invalid field {n:?}"); }
-        if n.starts_with(":") {
-            if regular { throw conn_err(PROTOCOL_ERROR, "pseudo-header after regular field"); }
-            // A repeated pseudo-header is malformed.
-            if seen.iter().any(|x| x == n) { throw conn_err(PROTOCOL_ERROR, f"repeated pseudo-header {n}"); }
-            seen.push(n);
-            if n == ":method" {
-                method = v;
-            } else if n == ":scheme" {
-                scheme = v;
-            } else if n == ":authority" {
-                authority = v;
-            } else if n == ":path" {
-                path = v;
-            } else {
-                throw conn_err(PROTOCOL_ERROR, f"unexpected pseudo-header {n}");
-            }
-            continue;
-        }
-        regular = true;
-        if connection_specific(n) || n == "te" && v != "trailers" { throw conn_err(PROTOCOL_ERROR, f"connection-specific field {n}"); }
-        if n == "cookie" { cookies.push(v); } else { h.append(n, v); }
-    }
-    // 8.2.3: cookie fields are joined for an HTTP/1.1 view.
-    if !cookies.is_empty() { h.append("cookie", cookies.join("; ")); }
-    let m = try Method::parse(method ?? "") catch _ { throw conn_err(PROTOCOL_ERROR, "missing or invalid :method"); };
-    let u = Uri {};
-    if m == Method::CONNECT {
-        if scheme is str || path is str || authority is none { throw conn_err(PROTOCOL_ERROR, "malformed CONNECT"); }
-    } else {
-        let p = path ?? "";
-        if scheme is none || p.is_empty() { throw conn_err(PROTOCOL_ERROR, "missing :scheme or :path"); }
-        if p == "*" {
-            u.path = "*";
-        } else {
-            if !p.starts_with("/") { throw conn_err(PROTOCOL_ERROR, "invalid :path"); }
-            u = try Uri::parse(p) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :path"); };
-            if u.fragment is str { throw conn_err(PROTOCOL_ERROR, "fragment in :path"); }
-        }
-        u.scheme = scheme ?? "";
-    }
-    let a = authority ?? (h.get("host") ?? "");
-    if !a.is_empty() {
-        let au = try Uri::parse("//" + a) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :authority"); };
-        if au.userinfo is str || !au.path.is_empty() || au.query is str { throw conn_err(PROTOCOL_ERROR, "invalid :authority"); }
-        u.host = au.host;
-        u.port = au.port;
-    }
-    Request { method: m, uri: u, version: Version::Http2, headers: h, body: Body::empty() }
-}
-
-fn response_fields(resp: Response) -> List<(str, str)> {
-    let h = resp.headers;
-    let ok = true;
-    try h.validate() catch _ { ok = false; };
-    let code = resp.status.as_u16();
-    let out: List<(str, str)> = [(":status", f"{code}")];
-    if !ok {
-        out[0] = (":status", "500");
-        out.push(("content-length", "0"));
-        return out;
-    }
-    for (n, v) in h.entries() {
-        if !connection_specific(n) && n != "te" { out.push((n, v)); }
-    }
-    if !h.contains("date") { out.push(("date", h1::date_now())); }
-    if !h.contains("content-length") && code != 204u16 && code != 304u16 {
-        if let n: u64 = resp.body.len() { out.push(("content-length", f"{n}")); }
-    }
-    out
-}
-
-fn parse_response(fields: List<(str, str)>) throws (HttpError) -> Response {
-    let status: str | none = none;
-    let h = HeaderMap::new();
-    let regular = false;
-    for (n, v) in fields {
-        if !valid_field(n, v) { throw conn_err(PROTOCOL_ERROR, f"invalid field {n:?}"); }
-        if n.starts_with(":") {
-            if regular || n != ":status" || status is str { throw conn_err(PROTOCOL_ERROR, "invalid pseudo-header"); }
-            status = v;
-            continue;
-        }
-        regular = true;
-        if connection_specific(n) { throw conn_err(PROTOCOL_ERROR, f"connection-specific field {n}"); }
-        h.append(n, v);
-    }
-    let s = status ?? { throw conn_err(PROTOCOL_ERROR, "missing :status"); };
-    let b = s.as_bytes();
-    if b.len() != 3 { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }
-    let code = 0u16;
-    for x in b {
-        if x < 0x30u8 || x > 0x39u8 { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }
-        code = code * 10u16 + (x - 0x30u8) as u16;
-    }
-    Response { status: try StatusCode::new(code) catch _ { throw conn_err(PROTOCOL_ERROR, "invalid :status"); }, version: Version::Http2, headers: h, body: Body::empty() }
 }
 
 /// Serve one connection whose client preface is buffered in `io`.

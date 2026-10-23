@@ -406,7 +406,7 @@ pub(pkg) async fn write_response(io: Io, resp: Response, method: Method, version
     out.push_str(f"HTTP/1.1 {code} {resp.status.reason()}\r\n");
     if !h.contains("date") { out.push_str(f"date: {h1::date_now()}\r\n"); }
     // Fields the writer owns.
-    let skip: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"];
+    let skip = h1::writer_owned(false);
     let user_len = h.get("content-length");
     h1::push_fields(out, h, skip);
     let body = resp.body;

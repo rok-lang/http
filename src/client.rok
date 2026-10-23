@@ -318,7 +318,7 @@ impl Client {
         if !req.headers.contains("user-agent") {
             if let ua: str = cfg.user_agent { out.push_str(f"user-agent: {ua}\r\n"); }
         }
-        let skip: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te"];
+        let skip = h1::writer_owned(true);
         h1::push_fields(out, req.headers, skip);
         let body = req.body;
         let chunked = false;

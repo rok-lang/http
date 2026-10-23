@@ -463,6 +463,14 @@ pub fn http_date(secs: i64) -> str {
 
 pub(pkg) fn date_now() -> str { http_date((try? SystemTime::now().unix_seconds()) ?? 0i64) }
 
+/// Fields the message writer emits itself, so push_fields skips them. A
+/// request also skips `te`: the client owns transfer-coding negotiation.
+pub(pkg) fn writer_owned(with_te: bool) -> List<str> {
+    let f: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"];
+    if with_te { f.push("te"); }
+    f
+}
+
 /// Write `h` as field lines, skipping the names in `skip`.
 pub(pkg) fn push_fields(out: StrBuf, h: HeaderMap, skip: List<str>) {
     for (n, v) in h.entries() {
