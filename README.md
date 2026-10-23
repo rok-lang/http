@@ -138,3 +138,7 @@ A `rok::std::net::tls` connection runs one operation at a time, while HTTP/2 rea
 rok test        # unit tests (RFC 3986 / 7541 vectors), smuggling cases, loopback h1 and h2, plain and TLS
 rok fmt --check
 ```
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
