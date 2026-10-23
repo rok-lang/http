@@ -1,0 +1,20 @@
+// Parse a URL and an HTTP/1.1 request head (spec 9.9.11).
+
+use rok::core::bench::Bench;
+use rok::core::hint::black_box;
+use pkg::uri::Uri;
+
+#[bench]
+fn uri_parse(b: Bench) {
+    let url = "https://user:pass@example.com:8443/a/b/c?x=1&y=2&z=three#frag";
+    b.iter(|| try Uri::parse(black_box(url)) catch e { panic(f"{e}"); });
+}
+
+#[cfg(feature = "http1")]
+#[bench]
+fn request_head(b: Bench) {
+    let raw = "GET /path/to/resource?q=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: rok\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n";
+    let block = raw.as_bytes().to_list();
+    b.bytes(raw.len() as i64);
+    b.iter(|| try pkg::h1::parse_request_head(black_box(block), pkg::h1::Limits {}) catch e { panic(f"{e}"); });
+}
