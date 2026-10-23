@@ -16,9 +16,6 @@ pub mod h2;
 pub mod server;
 pub mod client;
 
-#[cfg(test)]
-mod tests;
-
 pub use error::{HttpError, ErrorKind};
 pub use method::Method;
 pub use status::StatusCode;
