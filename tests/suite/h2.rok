@@ -85,7 +85,7 @@ fn h2_graceful_shutdown() {
     task::block_on(async {
         let (srv, base) = start();
         let c = h2_client();
-        try! await (try! await c.get(base + "/")).body.bytes();
+        _ = try! await (try! await c.get(base + "/")).body.bytes();
         let slow = task::spawn(async { (try! await c.get(base + "/slow")).status.as_u16() });
         await task::sleep(Duration::ms(100));
         await srv.shutdown();

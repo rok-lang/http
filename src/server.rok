@@ -8,9 +8,9 @@ use rok::core::future::AsyncFuture;
 use rok::core::sync::Frozen;
 use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, io_err, deadline_in, spawn_with, start_tls};
+use pkg::conn::{Io, Tx, io_err, deadline_in, spawn_with, start_tls};
 use pkg::tls::Side;
-use pkg::error::HttpError;
+use pkg::error::{HttpError, ErrorKind};
 use pkg::h1;
 use pkg::h1::{Limits, Framing, Pumped, PumpOpts, DONE};
 use pkg::h2;
@@ -43,7 +43,9 @@ pub struct ServerConfig {
 }
 
 struct ConnEntry {
-    s: TcpStream;
+    /// A duplicate of the connection's socket, to shut it down (`none`
+    /// if the OS would not make one).
+    s: TcpStream | none;
     /// Waiting for a request (HTTP/1.1): closed at once on shutdown.
     idle: bool;
     /// Draining notice for an HTTP/2 connection.
@@ -52,13 +54,16 @@ struct ConnEntry {
 
 /// A bound server. Copies share it.
 pub struct Server {
-    l: TcpListener;
+    /// The listener until `run` takes it (and closes it at the end).
+    l: Mutex<List<TcpListener>>;
+    addr: SocketAddr;
     handler: Handler;
     cfg: ServerConfig;
     stopping: Atomic<bool>;
     ids: Atomic<u64>;
     conns: Mutex<Dict<u64, ConnEntry>>;
-    stop_tx: Sender<i32>;
+    /// Closed by `shutdown`: wakes `run`.
+    stop_tx: Tx<i32>;
     stop_rx: Receiver<i32>;
     /// TLS certificate and key, set once by `bind_tls`; empty for
     /// plaintext.
@@ -93,22 +98,25 @@ async fn accept_one(l: TcpListener) -> Accepted {
 }
 
 async fn stop_signal(rx: Receiver<i32>) -> Accepted {
-    await rx.recv_async();
+    _ = await rx.recv_async();
     Accepted::Stop
 }
 
 impl Server {
     pub fn bind(addr: str, handler: Handler, cfg: ServerConfig | none = none) throws (HttpError) -> Server {
         let l = try rok::std::net::tcp_listen(addr) catch e: IoError { throw io_err(e); };
+        let at = try l.local_addr() catch e: IoError { throw io_err(e); };
         let (tx, rx) = channel::<i32>();
+        let ls: List<TcpListener> = [l];
         Server {
-            l: l,
+            l: Mutex::new(ls),
+            addr: at,
             handler: handler,
             cfg: cfg ?? ServerConfig {},
             stopping: Atomic::new(false),
             ids: Atomic::new(0u64),
             conns: Mutex::new(Dict::new()),
-            stop_tx: tx,
+            stop_tx: Tx::new(tx),
             stop_rx: rx,
             tls: Mutex::new(List::new()),
         }
@@ -130,21 +138,22 @@ impl Server {
         cfg?.get()
     }
 
-    pub fn local_addr(self) throws (HttpError) -> SocketAddr {
-        try self.l.local_addr() catch e: IoError { throw io_err(e); }
-    }
+    pub fn local_addr(self) throws (HttpError) -> SocketAddr { self.addr }
 
-    /// Accept connections until `shutdown`.
+    /// Accept connections until `shutdown`. Runs once per server.
     pub async fn run(self) throws (HttpError) {
+        let found: TcpListener | none = none;
+        using g = self.l.lock() { found = g.get().pop(); }
+        let l = found ?? { throw HttpError::new(ErrorKind::Unsupported, "the server is already running"); };
         let failures = 0;
         while !self.stopping.load() {
-            let (_, a) = await task::select([accept_one(self.l), stop_signal(self.stop_rx)]);
+            let (_, a) = await task::select([accept_one(l), stop_signal(self.stop_rx)]);
             match a {
                 Accepted::Conn(s) => {
                     failures = 0;
                     let _ = try? s.set_nodelay(true);
                     let me = self;
-                    task::spawn(async {
+                    _ = task::spawn(async {
                         await me.conn_main(s);
                         0
                     });
@@ -158,7 +167,7 @@ impl Server {
                 },
             }
         }
-        try self.l.close() catch e: IoError { throw io_err(e); };
+        try l.close() catch e: IoError { throw io_err(e); };
     }
 
     /// Stop accepting, close idle connections, tell HTTP/2 connections
@@ -166,10 +175,10 @@ impl Server {
     /// `grace` the remaining connections are cut.
     pub async fn shutdown(self, grace: Duration | none = Duration::secs(30)) {
         if self.stopping.swap(true) { return; }
-        let _ = try? self.stop_tx.send(1);
+        self.stop_tx.close();
         using g = self.conns.lock() {
             for e in g.get().values() {
-                if e.idle { let _ = try? e.s.shutdown(Shutdown::Both); }
+                if e.idle { cut(e); }
                 if let d: Sender<i32> = e.drain { let _ = try? d.send(1); }
             }
         }
@@ -181,7 +190,7 @@ impl Server {
             if let t: Instant = end {
                 if Instant::now() >= t {
                     using g = self.conns.lock() {
-                        for e in g.get().values() { let _ = try? e.s.shutdown(Shutdown::Both); }
+                        for e in g.get().values() { cut(e); }
                     }
                     break;
                 }
@@ -208,35 +217,59 @@ impl Server {
         !self.stopping.load()
     }
 
+    /// Connection `id` is HTTP/2: never idle, drained by `tx`.
+    fn set_drain(self, id: u64, tx: Sender<i32>) {
+        using g = self.conns.lock() {
+            let d = g.get();
+            if let e: ConnEntry = d.get(id) {
+                e.drain = tx;
+                e.idle = false;
+                d.insert(id, e);
+            }
+        }
+    }
+
+    /// Forget connection `id`, closing what its entry holds.
+    fn drop_entry(self, id: u64) {
+        using g = self.conns.lock() {
+            if let e: ConnEntry = g.get().remove(id) {
+                if let s: TcpStream = e.s { let _ = try? s.close(); }
+                if let d: Sender<i32> = e.drain { d.close(); }
+            }
+        }
+    }
+
     async fn conn_main(self, s: TcpStream) {
         let id = self.ids.fetch_add(1u64);
-        self.set_entry(id, ConnEntry { s: s, idle: true, drain: none });
-        let io = Io::new(s);
-        let ok = !self.stopping.load();
+        let dup: TcpStream | none = try s.try_clone() catch _ { none };
+        self.set_entry(id, ConnEntry { s: dup, idle: true, drain: none });
         let secure = self.tls_config();
-        if let tc: tls::ServerConfig = secure {
-            tc.alpn_protocols = alpn(self.cfg.http2);
-            io = try await start_tls(io, Side::Server(tc), deadline_in(self.cfg.header_timeout)) catch _ {
-                ok = false;
-                io
-            };
-        }
-        if ok {
+        let plain = secure is none;
+        let io = match secure {
+            tc: tls::ServerConfig => {
+                tc.alpn_protocols = alpn(self.cfg.http2);
+                try await start_tls(s, Side::Server(tc), deadline_in(self.cfg.header_timeout)) catch _ {
+                    self.drop_entry(id);
+                    return;
+                }
+            },
+            none => Io::new(s),
+        };
+        if !self.stopping.load() {
             let is_h2 = false;
-            if secure is none && self.cfg.http2 || io.alpn == H2 {
+            if plain && self.cfg.http2 || io.alpn == H2 {
                 is_h2 = try await sniff_preface(io, deadline_in(self.cfg.header_timeout)) catch _ { false };
             }
             if is_h2 {
                 let (dtx, drx) = channel::<i32>();
-                self.set_entry(id, ConnEntry { s: s, idle: false, drain: dtx });
+                self.set_drain(id, dtx);
                 await self.serve_h2(io, drx);
-                dtx.close();
             } else {
                 await self.serve_h1(io, id);
             }
         }
         io.close();
-        using g = self.conns.lock() { g.get().remove(id); }
+        self.drop_entry(id);
     }
 
     #[cfg(feature = "http2")]
@@ -295,10 +328,10 @@ impl Server {
         };
         let (tx, rx) = channel::<Chunk>();
         let (ctx, crx) = channel::<(u32, usize)>();
-        let req = Request { method: head.method, uri: uri, version: head.version, headers: head.headers, body: Body::pulled(rx, ctx, 1u32, len) };
+        let req = Request { method: head.method, uri: uri, version: head.version, headers: head.headers, body: Body::pulled(rx, ctx.clone(), 1u32, len) };
         let (rtx, rrx) = channel::<Response>();
         let h = self.handler;
-        spawn_with(req, async |r: Request| {
+        _ = spawn_with(req, async |r: Request| {
             let resp = await h(r);
             let _ = try? rtx.send(resp);
             let _ = try? ctx.send((DONE, 0usize));
@@ -321,6 +354,11 @@ impl Server {
         let k = keep && pumped == Pumped::Complete && !self.stopping.load();
         try await write_response(io, resp, head.method, head.version, k, cfg.io_timeout)
     }
+}
+
+/// Shut down a connection's socket: its reads and writes end.
+fn cut(e: ConnEntry) {
+    if let s: TcpStream = e.s { let _ = try? s.shutdown(Shutdown::Both); }
 }
 
 /// ALPN protocol ids.

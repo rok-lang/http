@@ -124,14 +124,14 @@ fn bodies() {
             0
         });
         expect((try! await s.text()) == "abcd", "streamed");
-        await t;
+        _ = await t;
         let (w2, s2) = Body::channel();
         let t2 = task::spawn(async {
             await w2.fail(HttpError::new(ErrorKind::Closed, "gone"));
             0
         });
         expect((try? await s2.bytes()) is none, "error delivered");
-        await t2;
+        _ = await t2;
         expect((try? await Body::from_str("toolong").bytes(3)) is none, "limit");
     });
 }

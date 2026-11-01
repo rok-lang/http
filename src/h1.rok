@@ -329,12 +329,11 @@ pub(pkg) struct PumpOpts {
 }
 
 /// Feed the body framed by `fr` from `io` to `tx`, one piece per
-/// demand message on `credit` (see `Body`). After `Complete` the caller
-/// closes `tx`: a client pools `io` first, so the next request finds it.
+/// demand message on `credit` (see `Body`). The caller closes `tx`
+/// after: a client pools `io` first, so the next request finds it.
 pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) -> Pumped {
     let r = try await pump_inner(io, fr, tx, credit, opts) catch e: HttpError {
         let _ = try? await tx.send_async(e);
-        tx.close();
         Pumped::Failed
     };
     r
@@ -377,10 +376,7 @@ async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u3
                 last = remaining == 0u64;
             },
             Framing::Close => {
-                if io.buffered() == 0 && !(try await io.fill(dl)) {
-                    tx.close();
-                    return Pumped::ToClose;
-                }
+                if io.buffered() == 0 && !(try await io.fill(dl)) { return Pumped::ToClose; }
                 piece = io.take(io.buffered());
             },
             _ => {

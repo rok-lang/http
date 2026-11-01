@@ -16,13 +16,13 @@ struct Buf {
     at: usize;
 }
 
-/// A socket plus the bytes read from it and not consumed yet. Copies
-/// share both.
+/// A connection plus the bytes read from it and not consumed yet. It has
+/// one owner, which closes it.
 pub(pkg) struct Io {
-    pub s: TcpStream;
+    /// The socket, or the TLS connection's end (its tasks own the
+    /// socket).
+    c: TcpStream | Link;
     st: List<Buf>;
-    /// Set when the connection is TLS.
-    t: Link | none = none;
     /// The protocol ALPN chose (`""`: none, or plaintext).
     pub alpn: str = "";
 }
@@ -64,7 +64,7 @@ pub(pkg) fn earlier(a: Instant | none, b: Instant | none) -> Instant | none {
 }
 
 /// Connect to `host:port` before `deadline`.
-pub(pkg) async fn connect(host: str, port: u16, deadline: Instant | none) throws (HttpError) -> Io {
+pub(pkg) async fn dial(host: str, port: u16, deadline: Instant | none) throws (HttpError) -> TcpStream {
     let target = if host.contains(":") { f"[{host}]:{port}" } else { f"{host}:{port}" };
     let r = await within(connect_res(target), deadline, f"connect {target}");
     let s = match r {
@@ -72,38 +72,29 @@ pub(pkg) async fn connect(host: str, port: u16, deadline: Instant | none) throws
         Result::Err(e) => throw io_err(e),
     };
     let _ = try? s.set_nodelay(true);
-    Io::new(s)
+    s
 }
 
-/// The socket side of an `Io`, without its read buffer (shareable
-/// across tasks).
-pub(pkg) struct Wire {
-    s: TcpStream;
-    t: Link | none;
-    alpn: str;
-}
-
-/// TLS over `io` (fresh, nothing read yet), handshake done before
-/// `deadline`.
-pub(pkg) async fn start_tls(io: Io, side: Side, deadline: Instant | none) throws (HttpError) -> Io {
+/// TLS over the fresh socket `s`, handshake done before `deadline`. The
+/// TLS tasks own `s` from here on.
+pub(pkg) async fn start_tls(s: TcpStream, side: Side, deadline: Instant | none) throws (HttpError) -> Io {
     if !cfg!(feature = "tls") {
-        io.close();
+        let _ = try? s.close();
         throw HttpError::new(ErrorKind::Unsupported, "TLS needs the `tls` feature");
     }
-    match await within(start_res(io.s, side), deadline, "TLS handshake") {
+    match await within(start_res(s, side), deadline, "TLS handshake") {
         Result::Ok(r) => match r {
-            l: Link => Io { s: io.s, st: io.st, t: l, alpn: l.alpn },
-            m: str => {
-                io.close();
-                throw HttpError::new(ErrorKind::Tls, m);
+            l: Link => {
+                let a = l.alpn;
+                Io { c: l, st: [fresh()], alpn: a }
             },
+            m: str => throw HttpError::new(ErrorKind::Tls, m),
         },
-        Result::Err(e) => {
-            io.close();
-            throw io_err(e);
-        },
+        Result::Err(e) => throw io_err(e),
     }
 }
+
+fn fresh() -> Buf { Buf { data: List::new(), at: 0usize } }
 
 async fn start_res(s: TcpStream, side: Side) -> Result<Link | str, IoError> {
     try Result::Ok(await pkg::tls::start(s, side)) catch e: IoError { Result::Err(e) }
@@ -122,12 +113,17 @@ async fn next_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.next()) }
 async fn ack_res(rx: Receiver<str>) -> Result<str, IoError> { Result::Ok(await rx.recv_async() ?? "connection closed") }
 
 impl Io {
-    pub fn new(s: TcpStream) -> Io { Io { s: s, st: [Buf { data: List::new(), at: 0usize }] } }
+    pub fn new(s: TcpStream) -> Io { Io { c: s, st: [fresh()] } }
 
-    pub fn wire(self) -> Wire { Wire { s: self.s, t: self.t, alpn: self.alpn } }
-
-    /// An `Io` on `w` with an empty read buffer.
-    pub fn of(w: Wire) -> Io { Io { s: w.s, st: [Buf { data: List::new(), at: 0usize }], t: w.t, alpn: w.alpn } }
+    /// A second `Io` on the same connection with its own (empty) read
+    /// buffer, for writing from another task. Each is closed by its
+    /// owner; closing either ends the connection.
+    pub fn split(self) throws (HttpError) -> Io {
+        match self.c {
+            l: Link => Io { c: l.clone(), st: [fresh()], alpn: self.alpn },
+            s: TcpStream => Io { c: try s.try_clone() catch e: IoError { throw io_err(e); }, st: [fresh()], alpn: self.alpn },
+        }
+    }
 
     /// Number of unread bytes.
     pub fn buffered(self) -> usize { self.st[0].data.len() - self.st[0].at }
@@ -153,18 +149,19 @@ impl Io {
     pub async fn fill(self, deadline: Instant | none) throws (HttpError) -> bool {
         let scratch = zeroed(READ_CHUNK);
         let n = 0usize;
-        if let l: Link = self.t {
-            match try await recv_in(l, deadline) {
+        match self.c {
+            l: Link => match try await recv_in(l, deadline) {
                 In::Data(d) => {
                     scratch = d;
                     n = d.len();
                 },
                 In::Failed(m) => throw HttpError::new(ErrorKind::Io, m),
                 _ => return false,
-            }
-        } else {
-            n = try await read_some(self.s, scratch, deadline);
-            if n == 0 { return false; }
+            },
+            s: TcpStream => {
+                n = try await read_some(s, scratch, deadline);
+                if n == 0 { return false; }
+            },
         }
         let b = self.st[0];
         if b.at == b.data.len() {
@@ -187,36 +184,39 @@ impl Io {
     }
 
     pub async fn write(self, data: Slice<u8>, deadline: Instant | none) throws (HttpError) {
-        if let l: Link = self.t {
-            let (atx, arx) = channel::<str>();
-            try l.ops.send(Op::Write(data.to_list(), atx)) catch _ { throw HttpError::new(ErrorKind::Io, "connection closed"); };
-            match await within(ack_res(arx), deadline, "write") {
-                Result::Ok(m) => if !m.is_empty() { throw HttpError::new(ErrorKind::Io, m); },
-                Result::Err(e) => throw io_err(e),
-            }
-            return;
+        match self.c {
+            l: Link => {
+                let (atx, arx) = channel::<str>();
+                try l.ops.send(Op::Write(data.to_list(), atx)) catch _ { throw HttpError::new(ErrorKind::Io, "connection closed"); };
+                match await within(ack_res(arx), deadline, "write") {
+                    Result::Ok(m) => if !m.is_empty() { throw HttpError::new(ErrorKind::Io, m); },
+                    Result::Err(e) => throw io_err(e),
+                }
+            },
+            s: TcpStream => {
+                let r = await within(write_res(s, data), deadline, "write");
+                if let Result::Err(e) = r { throw io_err(e); }
+            },
         }
-        let r = await within(write_res(self.s, data), deadline, "write");
-        if let Result::Err(e) = r { throw io_err(e); }
     }
 
     /// Stop both directions: pending reads end. TLS sends close_notify.
     pub fn shutdown(self) {
-        if let l: Link = self.t {
-            let _ = try? l.ops.send(Op::Close);
-        } else {
-            let _ = try? self.s.shutdown(Shutdown::Both);
+        match self.c {
+            l: Link => { let _ = try? l.ops.send(Op::Close); },
+            s: TcpStream => { let _ = try? s.shutdown(Shutdown::Both); },
         }
     }
 
     /// End the connection; TLS sends close_notify first.
     pub fn close(self) {
-        if let l: Link = self.t {
-            let _ = try? l.ops.send(Op::Close);
-            return;
+        match self.c {
+            l: Link => l.close(),
+            s: TcpStream => {
+                let _ = try? s.shutdown(Shutdown::Both);
+                let _ = try? s.close();
+            },
         }
-        let _ = try? self.s.shutdown(Shutdown::Both);
-        let _ = try? self.s.close();
     }
 }
 
@@ -271,4 +271,44 @@ pub(pkg) fn spawn_with<T: Send, U: Send>(v: T, f: fn(T) -> AsyncFuture<U> + Send
             none => panic("spawn_with: value lost"),
         }
     })
+}
+
+/// A channel sender that copies of a handle share (a `Sender` itself has
+/// one owner): sends go through a lock, and `close` closes it for all.
+pub(pkg) struct Tx<T> {
+    m: Mutex<List<Sender<T>>>;
+}
+
+impl<T> Tx<T> {
+    pub fn new(s: Sender<T>) -> Tx<T> {
+        let l: List<Sender<T>> = [s];
+        Tx { m: Mutex::new(l) }
+    }
+
+    /// Queue `v`; `false` once closed.
+    pub fn send(self, v: T) -> bool {
+        let ok = false;
+        using g = self.m.lock() {
+            if let s: Sender<T> = g.get().first() {
+                ok = true;
+                try s.send(v) catch _ { ok = false; };
+            }
+        }
+        ok
+    }
+
+    /// A sender of its own on the channel, unless closed.
+    pub fn sender(self) -> Sender<T> | none {
+        let out: Sender<T> | none = none;
+        using g = self.m.lock() {
+            if let s: Sender<T> = g.get().first() { out = s.clone(); }
+        }
+        out
+    }
+
+    pub fn close(self) {
+        using g = self.m.lock() {
+            while let s: Sender<T> = g.get().pop() { s.close(); }
+        }
+    }
 }

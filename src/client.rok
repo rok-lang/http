@@ -4,7 +4,7 @@
 use rok::core::sync::Frozen;
 use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, connect, start_tls, deadline_in, earlier, spawn_with};
+use pkg::conn::{Io, dial, start_tls, deadline_in, earlier};
 use pkg::server::{H2, alpn};
 use pkg::tls::Side;
 use pkg::error::{HttpError, ErrorKind};
@@ -157,12 +157,14 @@ impl Client {
     /// says so (the connection is then kept for later requests).
     async fn fresh(self, key: str, secure: bool, host: str, port: u16, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
         let cd = earlier(deadline, deadline_in(self.cfg.connect_timeout));
-        let io = try await connect(host, port, cd);
-        if secure {
+        let s = try await dial(host, port, cd);
+        let io = if secure {
             let tc = try self.tls_config();
             tc.alpn_protocols = alpn(true);
-            io = try await start_tls(io, Side::Client(host, tc), cd);
-        }
+            try await start_tls(s, Side::Client(host, tc), cd)
+        } else {
+            Io::new(s)
+        };
         if secure && io.alpn == H2 || !secure && self.cfg.version == Version::Http2 {
             return try await self.start_h2(io, key, req, deadline);
         }
@@ -300,9 +302,9 @@ impl Client {
         resp.body = Body::pulled(rx, ctx, 1u32, len);
         let me = self;
         let opts = PumpOpts { read_timeout: cfg.read_timeout, want_timeout: cfg.idle_timeout };
-        spawn_with(io, async |c: Io| {
-            let p = await h1::pump(c, fr, tx, crx, opts);
-            if p == Pumped::Complete && reusable { me.checkin(key, c); } else { c.close(); }
+        _ = task::spawn(async {
+            let p = await h1::pump(io, fr, tx, crx, opts);
+            if p == Pumped::Complete && reusable { me.checkin(key, io); } else { io.close(); }
             tx.close();
             0
         });

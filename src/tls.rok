@@ -6,11 +6,17 @@
 // gives way at an await, and std keeps the connection's state whole
 // across those, so a read waiting for input never holds up a write.
 // The rest of the package talks to them over channels.
+//
+// The reader owns the connection; the writer has a `marker::share`d
+// handle and a duplicate of the socket. When it stops, the writer
+// shuts the socket down (a pending read ends) and the reader closes
+// the connection once the writer is done with it.
 
 use rok::std::net::{TcpStream, Shutdown};
 use rok::std::net::tls;
 use rok::core::io::{IoError, IoErrorKind};
-use pkg::conn::{spawn_with, zeroed};
+use rok::core::marker;
+use pkg::conn::zeroed;
 
 pub(pkg) enum Op {
     /// Write; the error message, or `""`, goes back on the sender.
@@ -30,7 +36,8 @@ pub(pkg) enum Side {
     Server(tls::ServerConfig),
 }
 
-/// The async end of a TLS connection. Copies share it.
+/// The async end of a TLS connection. The connection ends when every
+/// `Link` on it is gone or one sends `Op::Close`.
 pub(pkg) struct Link {
     pub ops: Sender<Op>;
     /// A message asks the reader for the next plaintext.
@@ -41,6 +48,16 @@ pub(pkg) struct Link {
 }
 
 impl Link {
+    /// End the connection (close_notify, then the socket closes).
+    pub fn close(self) {
+        let _ = try? self.ops.send(Op::Close);
+        self.ops.close();
+        self.reads.close();
+    }
+
+    /// Another end on the same connection.
+    pub fn clone(self) -> Link { Link { ops: self.ops.clone(), reads: self.reads.clone(), input: self.input, alpn: self.alpn } }
+
     /// The next plaintext, or `End` / `Failed`.
     pub async fn next(self) -> In {
         try self.reads.send(1) catch _ { return In::End; };
@@ -53,9 +70,10 @@ impl Link {
 /// to a `block_on` caller). A failed handshake gives its message.
 #[cfg(feature = "tls")]
 pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | str {
+    let wake = try real.try_clone();
     let (tx, rx) = channel::<Link | str | IoError>();
-    spawn_with((real, side), async |v: (TcpStream, Side)| {
-        let r: Link | str | IoError = try await run(v.0, v.1) catch e: tls::TlsError {
+    _ = task::spawn(async {
+        let r: Link | str | IoError = try await run(real, wake, side) catch e: tls::TlsError {
             if e.kind() == tls::TlsErrorKind::Io { IoError::new(IoErrorKind::Other, e.message()) } else { e.message() }
         };
         let _ = try? tx.send(r);
@@ -70,7 +88,7 @@ pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | 
 }
 
 #[cfg(feature = "tls")]
-async fn run(real: TcpStream, side: Side) throws (tls::TlsError) -> Link {
+async fn run(real: TcpStream, wake: TcpStream, side: Side) throws (tls::TlsError) -> Link {
     let c: tls::Client | tls::Server = match side {
         Side::Client(name, cfg) => try await tls::Client::with_config_async(real, name, cfg),
         Side::Server(cfg) => try await tls::Server::new_async(real, cfg),
@@ -82,19 +100,26 @@ async fn run(real: TcpStream, side: Side) throws (tls::TlsError) -> Link {
     let (otx, orx) = channel::<Op>();
     let (rtx, rrx) = channel::<i32>();
     let (itx, irx) = channel::<In>();
-    task::spawn_local(async {
-        await reader(c, real, rrx, itx);
+    let (dtx, drx) = channel::<i32>();
+    // Pinned to this worker with the reader, the writer only runs while
+    // the reader waits; it stops using `w` before it closes `dtx`.
+    let w = unsafe { marker::share(c) };
+    _ = task::spawn_local(async {
+        await writer(w, wake, orx, dtx);
         0
     });
-    task::spawn_local(async {
-        await writer(c, real, orx, rtx);
+    _ = task::spawn_local(async {
+        await reader(c, rrx, itx, drx);
         0
     });
     Link { ops: otx, reads: rtx, input: irx, alpn: try str::from_utf8(alpn ?? []) catch _ { "" } }
 }
 
 #[cfg(not(feature = "tls"))]
-pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | str { panic("TLS needs the `tls` feature") }
+pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | str {
+    try real.close();
+    panic("TLS needs the `tls` feature")
+}
 
 #[cfg(feature = "tls")]
 async fn tls_read(c: tls::Client | tls::Server, buf: List<u8>) throws (IoError) -> usize {
@@ -104,10 +129,10 @@ async fn tls_read(c: tls::Client | tls::Server, buf: List<u8>) throws (IoError) 
     }
 }
 
-/// One read per request; `input` closes when the connection ends, and
-/// the reader closes the socket.
+/// One read per request; `input` closes when the connection ends. Then
+/// waits for the writer (`done` closes) and closes the connection.
 #[cfg(feature = "tls")]
-async fn reader(c: tls::Client | tls::Server, sock: TcpStream, reads: Receiver<i32>, out: Sender<In>) {
+async fn reader(c: tls::Client | tls::Server, reads: Receiver<i32>, out: Sender<In>, done: Receiver<i32>) {
     let buf = zeroed(16384);
     while await reads.recv_async() is i32 {
         let n = try await tls_read(c, buf) catch e: IoError {
@@ -118,11 +143,17 @@ async fn reader(c: tls::Client | tls::Server, sock: TcpStream, reads: Receiver<i
         let _ = try? out.send(In::Data(buf[0:n].to_list()));
     }
     out.close();
-    let _ = try? sock.close();
+    _ = await done.recv_async();
+    match c {
+        x: tls::Client => { let _ = try? x.close(); },
+        x: tls::Server => { let _ = try? x.close(); },
+    }
 }
 
+/// Writes until `Op::Close` or every `Link` is gone, then sends
+/// close_notify and shuts `sock` (the connection's socket) down.
 #[cfg(feature = "tls")]
-async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>, reads: Sender<i32>) {
+async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>, done: Sender<i32>) {
     loop {
         match await ops.recv_async() ?? Op::Close {
             Op::Write(data, ack) => {
@@ -139,13 +170,14 @@ async fn writer(c: tls::Client | tls::Server, sock: TcpStream, ops: Receiver<Op>
         }
     }
     match c {
-        x: tls::Client => try? await x.close_notify_async(),
-        x: tls::Server => try? await x.close_notify_async(),
+        x: tls::Client => { let _ = try? await x.close_notify_async(); },
+        x: tls::Server => { let _ = try? await x.close_notify_async(); },
     }
     // Ends a pending read (closing the descriptor here would leave it
     // waiting), and the reader then ends.
     let _ = try? sock.shutdown(Shutdown::Both);
-    reads.close();
+    let _ = try? sock.close();
+    done.close();
     while let x: Op = ops.try_recv() {
         if let Op::Write(_, ack) = x { let _ = try? ack.send("connection closed"); }
     }
