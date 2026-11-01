@@ -1,6 +1,7 @@
 // The client: connection pool, HTTP/1.1 keep-alive, HTTP/2 over TLS
 // (ALPN) or by prior knowledge, redirects, timeouts.
 
+use rok::core::sync::Frozen;
 use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
 use pkg::conn::{Io, connect, start_tls, deadline_in, earlier, spawn_with};
@@ -19,10 +20,10 @@ use pkg::status::StatusCode;
 #[derive(Clone)]
 pub struct ClientConfig {
     /// Time from sending a request to its response head (per hop).
-    pub timeout: Duration | none = Duration::sec(30);
-    pub connect_timeout: Duration | none = Duration::sec(10);
+    pub timeout: Duration | none = Duration::secs(30);
+    pub connect_timeout: Duration | none = Duration::secs(10);
     /// Longest wait for one read of a response body.
-    pub read_timeout: Duration | none = Duration::sec(30);
+    pub read_timeout: Duration | none = Duration::secs(30);
     /// Redirects followed; 0 returns 3xx responses as they are.
     pub max_redirects: u32 = 10u32;
     /// `Http11`, or `Http2` to speak HTTP/2 to `http` URLs by prior
@@ -32,7 +33,7 @@ pub struct ClientConfig {
     /// Idle HTTP/1.1 connections kept per origin.
     pub max_idle_per_host: usize = 8;
     /// Idle connections older than this are not reused.
-    pub idle_timeout: Duration = Duration::sec(90);
+    pub idle_timeout: Duration = Duration::secs(90);
     /// Sent as `User-Agent` unless the request has one.
     pub user_agent: str | none = "rok-http/0.1";
     pub limits: Limits = Limits {};
@@ -158,7 +159,7 @@ impl Client {
         let cd = earlier(deadline, deadline_in(self.cfg.connect_timeout));
         let io = try await connect(host, port, cd);
         if secure {
-            let tc = self.tls_config();
+            let tc = try self.tls_config();
             tc.alpn_protocols = alpn(true);
             io = try await start_tls(io, Side::Client(host, tc), cd);
         }
@@ -222,14 +223,17 @@ impl Client {
 
     /// A connection's own copy of the TLS settings; the session cache
     /// stays shared (it locks itself).
-    fn tls_config(self) -> tls::ClientConfig {
+    fn tls_config(self) throws (HttpError) -> tls::ClientConfig {
         let cfg: Frozen<tls::ClientConfig> | none = none;
+        using g = self.tls.lock() { cfg = g.get().first(); }
+        if let c: Frozen<tls::ClientConfig> = cfg { return c.get(); }
+        let made = try tls::ClientConfig::new() catch e: tls::TlsError { throw HttpError::new(ErrorKind::Tls, e.message()); };
         using g = self.tls.lock() {
             let l = g.get();
-            if l.is_empty() { l.push(Frozen::new(tls::ClientConfig::new())); }
+            if l.is_empty() { l.push(Frozen::new(made)); }
             cfg = l[0];
         }
-        cfg?.get() ?? tls::ClientConfig::new()
+        cfg?.get() ?? made
     }
 
     /// Idle HTTP/1.1 connections pooled for `origin` (`http://host:port`).

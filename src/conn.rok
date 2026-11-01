@@ -2,7 +2,8 @@
 // and HTTP/2.
 
 use rok::std::net::{TcpStream, Shutdown};
-use rok::std::io::{IoError, IoErrorKind, byte_buf};
+use rok::core::io::{IoError, IoErrorKind};
+use rok::core::future::AsyncFuture;
 use pkg::error::{HttpError, ErrorKind};
 use pkg::tls::{Link, Op, In, Side};
 
@@ -27,14 +28,21 @@ pub(pkg) struct Io {
 }
 
 pub(pkg) fn io_err(e: IoError) -> HttpError {
-    if e.kind == IoErrorKind::TimedOut { return HttpError::new(ErrorKind::Timeout, e.message); }
-    HttpError::new(ErrorKind::Io, e.message)
+    if e.kind() == IoErrorKind::TimedOut { return HttpError::new(ErrorKind::Timeout, e.message()); }
+    HttpError::new(ErrorKind::Io, e.message())
+}
+
+/// `n` zero bytes, a read buffer.
+pub(pkg) fn zeroed(n: usize) -> List<u8> {
+    let out: List<u8> = List::with_capacity(n);
+    for _ in 0..n { out.push(0u8); }
+    out
 }
 
 pub(pkg) fn timed_out(what: str) -> HttpError { HttpError::new(ErrorKind::Timeout, f"{what}: timed out") }
 
 /// What is left of `deadline`, at least zero.
-pub(pkg) fn left(deadline: Instant) -> Duration { deadline.saturating_duration_since(Instant::now()) }
+pub(pkg) fn left(deadline: Instant) -> Duration { deadline.duration_since(Instant::now()).max(Duration::ZERO) }
 
 /// `now + d`, or `none`.
 pub(pkg) fn deadline_in(d: Duration | none) -> Instant | none {
@@ -143,7 +151,7 @@ impl Io {
 
     /// Read more from the socket; `false` at end of stream.
     pub async fn fill(self, deadline: Instant | none) throws (HttpError) -> bool {
-        let scratch = byte_buf(READ_CHUNK);
+        let scratch = zeroed(READ_CHUNK);
         let n = 0usize;
         if let l: Link = self.t {
             match try await recv_in(l, deadline) {
@@ -208,7 +216,7 @@ impl Io {
             return;
         }
         let _ = try? self.s.shutdown(Shutdown::Both);
-        self.s.close();
+        let _ = try? self.s.close();
     }
 }
 
@@ -237,7 +245,7 @@ async fn write_res(s: TcpStream, data: Slice<u8>) -> Result<usize, IoError> {
 
 async fn expire<T>(d: Duration, what: str) -> Result<T, IoError> {
     await task::sleep(d);
-    Result::Err(IoError::with_kind(IoErrorKind::TimedOut, f"{what}: timed out"))
+    Result::Err(IoError::new(IoErrorKind::TimedOut, f"{what}: timed out"))
 }
 
 /// `f`'s result, or a `TimedOut` error at `deadline` (`f` is then

@@ -461,7 +461,7 @@ pub fn http_date(secs: i64) -> str {
     f"{wd}, {d:02} {mon} {y:04} {sod / 3600:02}:{sod % 3600 / 60:02}:{sod % 60:02} GMT"
 }
 
-pub(pkg) fn date_now() -> str { http_date((try? SystemTime::now().unix_seconds()) ?? 0i64) }
+pub(pkg) fn date_now() -> str { http_date(SystemTime::now().unix_secs()) }
 
 /// Fields the message writer emits itself, so push_fields skips them. A
 /// request also skips `te`: the client owns transfer-coding negotiation.

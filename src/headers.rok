@@ -53,6 +53,7 @@ impl HeaderMap {
     }
 
     /// Remove every value of `name`; whether there was one.
+    #[discardable]
     pub fn remove(self, name: str) -> bool {
         let n = name.to_lowercase();
         let found = false;

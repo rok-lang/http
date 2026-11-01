@@ -3,7 +3,9 @@
 // knowledge (h2c), graceful shutdown.
 
 use rok::std::net::{TcpListener, TcpStream, SocketAddr, Shutdown};
-use rok::std::io::IoError;
+use rok::core::io::IoError;
+use rok::core::future::AsyncFuture;
+use rok::core::sync::Frozen;
 use rok::std::net::tls;
 use pkg::body::{Body, Chunk};
 use pkg::conn::{Io, io_err, deadline_in, spawn_with, start_tls};
@@ -25,11 +27,11 @@ pub type Handler = fn(Request) -> AsyncFuture<Response> + Send;
 pub struct ServerConfig {
     pub limits: Limits = Limits {};
     /// Time to receive a request head once its first byte arrived.
-    pub header_timeout: Duration | none = Duration::sec(30);
+    pub header_timeout: Duration | none = Duration::secs(30);
     /// Time a keep-alive connection may wait for its next request.
-    pub idle_timeout: Duration | none = Duration::sec(60);
+    pub idle_timeout: Duration | none = Duration::secs(60);
     /// Longest wait for one read of a request body / one write.
-    pub io_timeout: Duration | none = Duration::sec(60);
+    pub io_timeout: Duration | none = Duration::secs(60);
     /// Larger request bodies fail with `TooLarge` (the connection then
     /// closes).
     pub max_body: u64 | none = none;
@@ -156,13 +158,13 @@ impl Server {
                 },
             }
         }
-        self.l.close();
+        try self.l.close() catch e: IoError { throw io_err(e); };
     }
 
     /// Stop accepting, close idle connections, tell HTTP/2 connections
     /// to finish (GOAWAY), and wait for in-flight requests; after
     /// `grace` the remaining connections are cut.
-    pub async fn shutdown(self, grace: Duration | none = Duration::sec(30)) {
+    pub async fn shutdown(self, grace: Duration | none = Duration::secs(30)) {
         if self.stopping.swap(true) { return; }
         let _ = try? self.stop_tx.send(1);
         using g = self.conns.lock() {
@@ -260,7 +262,7 @@ impl Server {
                 x: List<u8> => x,
                 none => break,
             };
-            self.mark(id, false);
+            _ = self.mark(id, false);
             let keep = try await self.exchange(io, b) catch e: HttpError {
                 if e.code > 0u32 { let _ = try? await write_error(io, e, cfg); }
                 false
