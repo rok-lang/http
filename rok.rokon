@@ -5,6 +5,8 @@ Package {
     description: "HTTP/1.1 and HTTP/2 client and server: strict parsing, HPACK, streaming bodies, connection pooling",
     license: "MIT OR Apache-2.0",
     repository: "https://github.com/rok-lang/http",
+    keywords: ["http", "http2", "client", "server", "web"],
+    categories: ["network-programming", "web-programming"],
     deps: {},
     features: {
         "default": ["http1", "http2", "tls"],
