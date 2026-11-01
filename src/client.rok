@@ -35,7 +35,7 @@ pub struct ClientConfig {
     /// Idle connections older than this are not reused.
     pub idle_timeout: Duration = Duration::secs(90);
     /// Sent as `User-Agent` unless the request has one.
-    pub user_agent: str | none = "rok-http/0.1";
+    pub user_agent: str | none = "rok-http/0.2";
     pub limits: Limits = Limits {};
     pub h2: h2::Config = h2::Config {};
 }

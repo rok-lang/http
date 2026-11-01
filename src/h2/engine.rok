@@ -670,7 +670,7 @@ impl ClientConn {
         for (n, v) in req.headers.entries() {
             if !connection_specific(n) && n != "host" && n != "te" { fields.push((n, v)); }
         }
-        if !req.headers.contains("user-agent") { fields.push(("user-agent", "rok-http/0.1")); }
+        if !req.headers.contains("user-agent") { fields.push(("user-agent", "rok-http/0.2")); }
         let body = req.body;
         let empty = body.is_empty();
         if !empty && !req.headers.contains("content-length") {
