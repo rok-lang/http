@@ -12,10 +12,16 @@
 // shuts the socket down (a pending read ends) and the reader closes
 // the connection once the writer is done with it.
 
-use rok::std::net::{TcpStream, Shutdown};
+use rok::std::net::TcpStream;
 use rok::std::net::tls;
-use rok::core::io::{IoError, IoErrorKind};
+use rok::core::io::IoError;
+#[cfg(feature = "tls")]
+use rok::std::net::Shutdown;
+#[cfg(feature = "tls")]
+use rok::core::io::IoErrorKind;
+#[cfg(feature = "tls")]
 use rok::core::marker;
+#[cfg(feature = "tls")]
 use pkg::conn::zeroed;
 
 pub(pkg) enum Op {
@@ -116,7 +122,7 @@ async fn run(real: TcpStream, wake: TcpStream, side: Side) throws (tls::TlsError
 }
 
 #[cfg(not(feature = "tls"))]
-pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | str {
+pub(pkg) async fn start(real: TcpStream, _side: Side) throws (IoError) -> Link | str {
     try real.close();
     panic("TLS needs the `tls` feature")
 }

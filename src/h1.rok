@@ -7,12 +7,18 @@
 // valid Content-Length, Transfer-Encoding only as exactly `chunked` and
 // never together with Content-Length or in HTTP/1.0.
 
-use pkg::body::Chunk;
-use pkg::conn::{Io, deadline_in};
+#[cfg(any(feature = "http1", feature = "http2"))]
 use pkg::error::{HttpError, ErrorKind};
-use pkg::headers::{HeaderMap, is_token, is_field_value};
+use pkg::headers::HeaderMap;
 use pkg::message::Version;
 use pkg::method::Method;
+#[cfg(feature = "http1")]
+use pkg::body::Chunk;
+#[cfg(feature = "http1")]
+use pkg::conn::{Io, deadline_in};
+#[cfg(feature = "http1")]
+use pkg::headers::{is_token, is_field_value};
+#[cfg(any(feature = "http1", feature = "http2"))]
 use rok::std::time::SystemTime;
 
 /// Size limits of a message head.
@@ -27,6 +33,7 @@ pub struct Limits {
 
 /// A parse failure answered with HTTP status `status` (400, 414, 431,
 /// 501, 505).
+#[cfg(any(feature = "http1", feature = "http2"))]
 pub(pkg) fn bad(status: u16, msg: str) -> HttpError {
     HttpError { kind: if status == 431u16 || status == 414u16 { ErrorKind::TooLarge } else { ErrorKind::Parse }, message: msg, code: status as u32 }
 }
@@ -58,6 +65,7 @@ pub(pkg) enum Framing {
 /// ended before its first byte. `first`: the deadline for that first
 /// byte; `rest`: for the remainder. Leading empty lines are skipped
 /// (RFC 9112 2.2).
+#[cfg(feature = "http1")]
 pub(pkg) async fn read_block(io: Io, max: usize, first: Instant | none, rest: Instant | none) throws (HttpError) -> List<u8> | none {
     let started = false;
     let scanned = 0usize;
@@ -95,6 +103,7 @@ pub(pkg) async fn read_block(io: Io, max: usize, first: Instant | none, rest: In
 
 /// The lines of a head block, without CRLFs; a bare CR or LF, a NUL or
 /// invalid UTF-8 is an error.
+#[cfg(feature = "http1")]
 fn lines_of(block: List<u8>) throws (HttpError) -> List<str> {
     let out: List<str> = List::new();
     let start = 0usize;
@@ -116,12 +125,14 @@ fn lines_of(block: List<u8>) throws (HttpError) -> List<str> {
     out
 }
 
+#[cfg(feature = "http1")]
 fn line_str(block: List<u8>, a: usize, b: usize) throws (HttpError) -> str {
     try str::from_utf8(block[a:b]) catch _ { throw bad(400u16, "message head is not UTF-8"); }
 }
 
 /// `HTTP/1.1` / `HTTP/1.0`; another `HTTP/x.y` is 505, anything else
 /// 400.
+#[cfg(feature = "http1")]
 fn parse_version(s: str) throws (HttpError) -> Version {
     if s == "HTTP/1.1" { return Version::Http11; }
     if s == "HTTP/1.0" { return Version::Http10; }
@@ -133,6 +144,7 @@ fn parse_version(s: str) throws (HttpError) -> Version {
 }
 
 /// Header fields from lines `from..`, strictly (RFC 9112 5).
+#[cfg(feature = "http1")]
 fn parse_fields(lines: List<str>, from: usize, lim: Limits) throws (HttpError) -> HeaderMap {
     let h = HeaderMap::new();
     if lines.len() - from > lim.max_fields { throw bad(431u16, "too many header fields"); }
@@ -148,8 +160,10 @@ fn parse_fields(lines: List<str>, from: usize, lim: Limits) throws (HttpError) -
     h
 }
 
+#[cfg(feature = "http1")]
 fn is_digit(b: u8) -> bool { b >= 0x30u8 && b <= 0x39u8 }
 
+#[cfg(feature = "http1")]
 fn trim_ows(s: str) -> str {
     let b = s.as_bytes();
     let a = 0usize;
@@ -159,6 +173,7 @@ fn trim_ows(s: str) -> str {
     s[a:e]
 }
 
+#[cfg(feature = "http1")]
 pub(pkg) fn parse_request_head(block: List<u8>, lim: Limits) throws (HttpError) -> ReqHead {
     let lines = try lines_of(block);
     if lines.is_empty() { throw bad(400u16, "empty request"); }
@@ -175,6 +190,7 @@ pub(pkg) fn parse_request_head(block: List<u8>, lim: Limits) throws (HttpError) 
     ReqHead { method: m, target: target, version: v, headers: try parse_fields(lines, 1, lim) }
 }
 
+#[cfg(feature = "http1")]
 pub(pkg) fn parse_response_head(block: List<u8>, lim: Limits) throws (HttpError) -> RespHead {
     let lines = try lines_of(block);
     if lines.is_empty() { throw bad(400u16, "empty response"); }
@@ -194,6 +210,7 @@ pub(pkg) fn parse_response_head(block: List<u8>, lim: Limits) throws (HttpError)
 }
 
 /// The single valid Content-Length, if any.
+#[cfg(feature = "http1")]
 fn content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
     let all = h.get_all("content-length");
     if all.is_empty() { return none; }
@@ -209,6 +226,7 @@ fn content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
 }
 
 /// The transfer codings, lowercase, in order.
+#[cfg(feature = "http1")]
 fn codings(h: HeaderMap) -> List<str> {
     let out: List<str> = List::new();
     for v in h.get_all("transfer-encoding") {
@@ -217,6 +235,7 @@ fn codings(h: HeaderMap) -> List<str> {
     out
 }
 
+#[cfg(feature = "http1")]
 pub(pkg) fn request_framing(h: ReqHead) throws (HttpError) -> Framing {
     let te = codings(h.headers);
     if !te.is_empty() {
@@ -232,6 +251,7 @@ pub(pkg) fn request_framing(h: ReqHead) throws (HttpError) -> Framing {
     }
 }
 
+#[cfg(feature = "http1")]
 pub(pkg) fn response_framing(method: Method, h: RespHead) throws (HttpError) -> Framing {
     if method == Method::HEAD || h.status < 200u16 || h.status == 204u16 || h.status == 304u16 { return Framing::Empty; }
     let te = codings(h.headers);
@@ -248,6 +268,7 @@ pub(pkg) fn response_framing(method: Method, h: RespHead) throws (HttpError) -> 
 }
 
 /// A line ending in CRLF (without it), at most `max` bytes.
+#[cfg(feature = "http1")]
 async fn read_line(io: Io, max: usize, deadline: Instant | none) throws (HttpError) -> str {
     let scanned = 0usize;
     loop {
@@ -274,6 +295,7 @@ async fn read_line(io: Io, max: usize, deadline: Instant | none) throws (HttpErr
 
 /// A chunk-size line's size (RFC 9112 7.1); extensions are checked and
 /// dropped.
+#[cfg(feature = "http1")]
 fn chunk_size(line: str) throws (HttpError) -> u64 {
     let b = line.as_bytes();
     let n = 0u64;
@@ -293,6 +315,7 @@ fn chunk_size(line: str) throws (HttpError) -> u64 {
     n
 }
 
+#[cfg(feature = "http1")]
 fn hex_digit(b: u8) -> u64 | none {
     if b >= 0x30u8 && b <= 0x39u8 { return (b - 0x30u8) as u64; }
     if b >= 0x61u8 && b <= 0x66u8 { return (b - 0x61u8 + 10u8) as u64; }
@@ -331,6 +354,7 @@ pub(pkg) struct PumpOpts {
 /// Feed the body framed by `fr` from `io` to `tx`, one piece per
 /// demand message on `credit` (see `Body`). The caller closes `tx`
 /// after: a client pools `io` first, so the next request finds it.
+#[cfg(feature = "http1")]
 pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) -> Pumped {
     let r = try await pump_inner(io, fr, tx, credit, opts) catch e: HttpError {
         let _ = try? await tx.send_async(e);
@@ -339,6 +363,7 @@ pub(pkg) async fn pump(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<
     r
 }
 
+#[cfg(feature = "http1")]
 async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u32, usize)>, opts: PumpOpts) throws (HttpError) -> Pumped {
     let remaining = match fr {
         Framing::Length(n) => n,
@@ -420,14 +445,17 @@ async fn pump_inner(io: Io, fr: Framing, tx: Sender<Chunk>, credit: Receiver<(u3
     }
 }
 
+#[cfg(any(feature = "http1", feature = "http2"))]
 async fn recv_any<T>(rx: Receiver<T>) -> T | none { await rx.recv_async() }
 
+#[cfg(any(feature = "http1", feature = "http2"))]
 async fn nothing<T>(d: Duration) -> T | none {
     await task::sleep(d);
     none
 }
 
 /// The next message of `rx`, or `none` when closed or after `limit`.
+#[cfg(any(feature = "http1", feature = "http2"))]
 pub(pkg) async fn recv_within<T>(rx: Receiver<T>, limit: Duration | none) -> T | none {
     match limit {
         none => await rx.recv_async(),
@@ -457,10 +485,12 @@ pub fn http_date(secs: i64) -> str {
     f"{wd}, {d:02} {mon} {y:04} {sod / 3600:02}:{sod % 3600 / 60:02}:{sod % 60:02} GMT"
 }
 
+#[cfg(any(feature = "http1", feature = "http2"))]
 pub(pkg) fn date_now() -> str { http_date(SystemTime::now().unix_secs()) }
 
 /// Fields the message writer emits itself, so push_fields skips them. A
 /// request also skips `te`: the client owns transfer-coding negotiation.
+#[cfg(feature = "http1")]
 pub(pkg) fn writer_owned(with_te: bool) -> List<str> {
     let f: List<str> = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"];
     if with_te { f.push("te"); }
@@ -468,6 +498,7 @@ pub(pkg) fn writer_owned(with_te: bool) -> List<str> {
 }
 
 /// Write `h` as field lines, skipping the names in `skip`.
+#[cfg(feature = "http1")]
 pub(pkg) fn push_fields(out: StrBuf, h: HeaderMap, skip: List<str>) {
     for (n, v) in h.entries() {
         let drop = false;
@@ -484,6 +515,7 @@ pub(pkg) fn push_fields(out: StrBuf, h: HeaderMap, skip: List<str>) {
 }
 
 /// The bytes of `s` followed by `tail`.
+#[cfg(feature = "http1")]
 pub(pkg) fn concat(s: str, tail: List<u8>) -> List<u8> {
     let out = s.as_bytes().to_list();
     out.extend(tail);

@@ -3,17 +3,24 @@
 
 use rok::core::sync::Frozen;
 use rok::std::net::tls;
-use pkg::body::{Body, Chunk};
+use pkg::body::Body;
 use pkg::conn::{Io, dial, start_tls, deadline_in, earlier};
 use pkg::server::{H2, alpn};
 use pkg::tls::Side;
 use pkg::error::{HttpError, ErrorKind};
-use pkg::h1;
-use pkg::h1::{Limits, Framing, Pumped, PumpOpts};
+use pkg::h1::Limits;
 use pkg::h2;
-use pkg::headers::HeaderMap;
 use pkg::message::{Request, Response, Version};
 use pkg::method::Method;
+#[cfg(feature = "http1")]
+use pkg::body::Chunk;
+#[cfg(feature = "http1")]
+use pkg::h1;
+#[cfg(feature = "http1")]
+use pkg::h1::{Framing, Pumped, PumpOpts};
+#[cfg(feature = "http1")]
+use pkg::headers::HeaderMap;
+#[cfg(feature = "http1")]
 use pkg::status::StatusCode;
 
 /// Client settings. Every field has a default.
@@ -182,7 +189,7 @@ impl Client {
     }
 
     #[cfg(not(feature = "http2"))]
-    fn h2_ready(self, key: str) -> bool { false }
+    fn h2_ready(self, _key: str) -> bool { false }
 
     /// `req` on the pooled HTTP/2 connection to `key` (a new connection
     /// when it went away meanwhile).
@@ -218,7 +225,7 @@ impl Client {
     }
 
     #[cfg(not(feature = "http2"))]
-    async fn start_h2(self, io: Io, key: str, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+    async fn start_h2(self, io: Io, _key: str, _req: Request, _deadline: Instant | none) throws (HttpError) -> Response {
         io.close();
         throw HttpError::new(ErrorKind::Unsupported, "HTTP/2 needs the `http2` feature");
     }
@@ -258,6 +265,7 @@ impl Client {
         none
     }
 
+    #[cfg(feature = "http1")]
     fn checkin(self, key: str, io: Io) {
         using g = self.pool.lock() {
             let d = g.get();
@@ -272,7 +280,7 @@ impl Client {
     }
 
     #[cfg(not(feature = "http1"))]
-    async fn h1_exchange(self, io: Io, key: str, req: Request, deadline: Instant | none) throws (HttpError) -> Response {
+    async fn h1_exchange(self, io: Io, _key: str, _req: Request, _deadline: Instant | none) throws (HttpError) -> Response {
         io.close();
         throw HttpError::new(ErrorKind::Unsupported, "HTTP/1.1 needs the `http1` feature");
     }

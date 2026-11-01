@@ -39,6 +39,7 @@ pub(pkg) fn zeroed(n: usize) -> List<u8> {
     out
 }
 
+#[cfg(feature = "http2")]
 pub(pkg) fn timed_out(what: str) -> HttpError { HttpError::new(ErrorKind::Timeout, f"{what}: timed out") }
 
 /// What is left of `deadline`, at least zero.
@@ -262,6 +263,7 @@ async fn within<T>(f: AsyncFuture<Result<T, IoError>>, deadline: Instant | none,
 
 /// Move `v` into a new task running `f(v)`: a spawned future may not
 /// capture a collection the spawner keeps, so `v` crosses a channel.
+#[cfg(any(feature = "http1", feature = "http2"))]
 pub(pkg) fn spawn_with<T: Send, U: Send>(v: T, f: fn(T) -> AsyncFuture<U> + Send) -> Task<U> {
     let (tx, rx) = channel::<T>();
     try! tx.send(v);

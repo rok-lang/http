@@ -7,17 +7,28 @@ use rok::core::io::IoError;
 use rok::core::future::AsyncFuture;
 use rok::core::sync::Frozen;
 use rok::std::net::tls;
-use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, Tx, io_err, deadline_in, spawn_with, start_tls};
+use pkg::conn::{Io, Tx, io_err, deadline_in, start_tls};
 use pkg::tls::Side;
 use pkg::error::{HttpError, ErrorKind};
-use pkg::h1;
-use pkg::h1::{Limits, Framing, Pumped, PumpOpts, DONE};
+use pkg::h1::Limits;
 use pkg::h2;
-use pkg::message::{Request, Response, Version};
+use pkg::message::{Request, Response};
+#[cfg(feature = "http1")]
+use pkg::h1;
+#[cfg(feature = "http1")]
+use pkg::message::Version;
+#[cfg(feature = "http1")]
 use pkg::method::Method;
+#[cfg(feature = "http1")]
 use pkg::status::StatusCode;
+#[cfg(feature = "http1")]
 use pkg::uri::Uri;
+#[cfg(feature = "http1")]
+use pkg::body::{Body, Chunk};
+#[cfg(feature = "http1")]
+use pkg::conn::spawn_with;
+#[cfg(feature = "http1")]
+use pkg::h1::{Framing, Pumped, PumpOpts, DONE};
 
 /// The request handler: one call per request, each in its own task.
 pub type Handler = fn(Request) -> AsyncFuture<Response> + Send;
@@ -206,6 +217,7 @@ impl Server {
 
     /// Mark connection `id` idle (`true`) or busy; `false` if the server
     /// is stopping (then the connection should end).
+    #[cfg(feature = "http1")]
     fn mark(self, id: u64, idle: bool) -> bool {
         using g = self.conns.lock() {
             let d = g.get();
@@ -276,10 +288,10 @@ impl Server {
     async fn serve_h2(self, io: Io, drain: Receiver<i32>) { await h2::serve_conn(io, self.handler, self.cfg.h2, drain); }
 
     #[cfg(not(feature = "http2"))]
-    async fn serve_h2(self, io: Io, drain: Receiver<i32>) {}
+    async fn serve_h2(self, _io: Io, _drain: Receiver<i32>) {}
 
     #[cfg(not(feature = "http1"))]
-    async fn serve_h1(self, io: Io, id: u64) {}
+    async fn serve_h1(self, _io: Io, _id: u64) {}
 
     #[cfg(feature = "http1")]
     async fn serve_h1(self, io: Io, id: u64) {
@@ -391,6 +403,7 @@ async fn sniff_preface(io: Io, deadline: Instant | none) throws (HttpError) -> b
 }
 
 /// The request's URI from its target (RFC 9112 3.2) and `Host`.
+#[cfg(feature = "http1")]
 fn request_uri(head: h1::ReqHead) throws (HttpError) -> Uri {
     let hosts = head.headers.get_all("host");
     if hosts.len() > 1 || head.version == Version::Http11 && hosts.is_empty() { throw h1::bad(400u16, "missing or repeated Host"); }
@@ -423,6 +436,7 @@ fn request_uri(head: h1::ReqHead) throws (HttpError) -> Uri {
 }
 
 /// Answer a request that could not be parsed, then close.
+#[cfg(feature = "http1")]
 async fn write_error(io: Io, e: HttpError, cfg: ServerConfig) throws (HttpError) {
     let st = try StatusCode::new(e.code as u16) catch _ { StatusCode::BAD_REQUEST };
     let msg = e.message + "\n";
@@ -431,6 +445,7 @@ async fn write_error(io: Io, e: HttpError, cfg: ServerConfig) throws (HttpError)
 }
 
 /// Write `resp`; whether the connection may stay open.
+#[cfg(feature = "http1")]
 pub(pkg) async fn write_response(io: Io, resp: Response, method: Method, version: Version, keep: bool, timeout: Duration | none) throws (HttpError) -> bool {
     let h = resp.headers;
     let resp_ok = true;

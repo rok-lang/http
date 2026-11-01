@@ -41,6 +41,7 @@ impl Body {
     }
 
     /// A body fed by a producer that is told when it is read.
+    #[cfg(any(feature = "http1", feature = "http2"))]
     pub(pkg) fn pulled(rx: Receiver<Chunk>, credit: Sender<(u32, usize)> | none, tag: u32, len: u64 | none) -> Body {
         Body { rx: rx, credit: credit, tag: tag, len: len }
     }
