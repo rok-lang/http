@@ -26,12 +26,10 @@ use pkg::uri::Uri;
 #[cfg(feature = "http1")]
 use pkg::body::{Body, Chunk};
 #[cfg(feature = "http1")]
-use pkg::conn::spawn_with;
-#[cfg(feature = "http1")]
 use pkg::h1::{Framing, Pumped, PumpOpts, DONE};
 
 /// The request handler: one call per request, each in its own task.
-pub type Handler = fn(Request) -> AsyncFuture<Response> + Send;
+pub type Handler = fn(Request) -> AsyncFuture<Response> + Send + Sync;
 
 /// Server settings. Every field has a default.
 #[derive(Clone)]
@@ -343,12 +341,12 @@ impl Server {
         let req = Request { method: head.method, uri: uri, version: head.version, headers: head.headers, body: Body::pulled(rx, ctx.clone(), 1u32, len) };
         let (rtx, rrx) = channel::<Response>();
         let h = self.handler;
-        _ = spawn_with(req, async |r: Request| {
-            let resp = await h(r);
+        _ = task::spawn((async [move req] || {
+            let resp = await h(req);
             let _ = try? rtx.send(resp);
             let _ = try? ctx.send((DONE, 0usize));
             0
-        });
+        })());
         let pumped = await h1::pump(io, fr, tx, crx, PumpOpts { cont: cont, read_timeout: cfg.io_timeout, max: cfg.max_body });
         tx.close();
         if pumped != Pumped::Abandoned {

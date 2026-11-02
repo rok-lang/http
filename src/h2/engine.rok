@@ -5,7 +5,7 @@
 // WINDOW_UPDATEs. Stream state shared by them sits behind one mutex.
 
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, Tx, deadline_in, left, spawn_with};
+use pkg::conn::{Io, Tx, deadline_in, left};
 use pkg::error::{HttpError, ErrorKind};
 use pkg::h1::recv_within;
 use pkg::h2::frame::{Frame, conn_err, u32_at};
@@ -527,10 +527,10 @@ impl Shared {
         self.cmd(Cmd::Open(sid));
         if let pv: str = req.headers.get("priority") { self.cmd(Cmd::Priority(sid, frame::parse_priority(pv))); }
         let me = self;
-        _ = spawn_with(req, async |r: Request| {
-            await me.respond(sid, handler, r);
+        _ = task::spawn((async [move req] || {
+            await me.respond(sid, handler, req);
             0
-        });
+        })());
     }
 
     async fn respond(self, sid: u32, handler: Handler, req: Request) {
@@ -715,11 +715,11 @@ impl ClientConn {
             await task::sleep(Duration::ms(5));
         }
         if !empty {
-            _ = spawn_with(body, async |b: Body| {
-                await sh.send_body(sid, b);
+            _ = task::spawn((async [move body] || {
+                await sh.send_body(sid, body);
                 sh.finish(sid, true);
                 0
-            });
+            })());
         }
         let limit: Duration | none = match deadline {
             d: Instant => left(d),
