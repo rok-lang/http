@@ -7,7 +7,8 @@ pub(pkg) type Chunk = List<u8> | HttpError;
 
 /// A message body: a stream of byte chunks read once with `chunk`,
 /// `bytes` or `text`. A body built from bytes also keeps them, so a
-/// request with one can be resent (redirects). Copies share the stream.
+/// request with one can be resent (redirects). A body has one owner:
+/// `let b = a`, storing it or capturing it moves it.
 pub struct Body {
     rx: Receiver<Chunk> | none;
     /// Demand and consumption reports to the producer: `(tag, 0)` before
