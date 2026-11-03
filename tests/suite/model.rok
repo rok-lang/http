@@ -1,4 +1,4 @@
-// Message model tests.
+// Message model.
 
 use pkg::*;
 use sup::{expect, fails};
@@ -23,7 +23,7 @@ fn uri_parse() {
 
 #[test]
 fn uri_resolve_rfc3986() {
-    // RFC 3986 5.4.1 and 5.4.2.
+    // The RFC 3986 normal and abnormal examples.
     let base = uri("http://a/b/c/d;p?q");
     let cases = [
         ("g:h", "g:h"), ("g", "http://a/b/c/g"), ("./g", "http://a/b/c/g"), ("g/", "http://a/b/c/g/"),

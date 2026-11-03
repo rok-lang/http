@@ -31,7 +31,7 @@ fn unquote(v: str) -> str {
     if v.len() >= 2 && v.starts_with("\"") && v.ends_with("\"") { v[1:v.len() - 1] } else { v }
 }
 
-/// A `cookie-octet` (4.1.1): visible ASCII except `"` `,` `;` `\`.
+/// A `cookie-octet`: visible ASCII except `"` `,` `;` `\`.
 fn is_cookie_octet(b: u8) -> bool {
     b == 0x21u8 || b >= 0x23u8 && b <= 0x2Bu8 || b >= 0x2Du8 && b <= 0x3Au8 || b >= 0x3Cu8 && b <= 0x5Bu8
         || b >= 0x5Du8 && b <= 0x7Eu8
@@ -60,7 +60,7 @@ pub struct SetCookie {
 }
 
 impl SetCookie {
-    /// Parse as a user agent does (RFC 6265 5.2): `none` when there is
+    /// Parse as a user agent does: `none` when there is
     /// no `=` or the name is empty; unknown or malformed attributes are
     /// ignored.
     pub fn parse(s: str) -> SetCookie | none {
@@ -93,7 +93,7 @@ impl SetCookie {
         c
     }
 
-    /// The header value (RFC 6265 4.1); throws if the name, value or an
+    /// The header value; throws if the name, value or an
     /// attribute could break the header.
     pub fn to_header(self) throws (HttpError) -> str {
         try check_pair(self.name, self.value);

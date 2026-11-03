@@ -65,7 +65,7 @@ fn loopback_h2() {
 }
 
 /// A handler that answers as soon as it has read the request body:
-/// the response's last DATA must still reach the client (8.1).
+/// the response's last DATA must still reach the client.
 #[test]
 fn h2_echo_right_after_body() {
     task::block_on(async {

@@ -1,4 +1,4 @@
-// HTTP/2 frames (RFC 9113 section 4 and 6).
+// HTTP/2 frames (RFC 9113).
 
 use pkg::conn::Io;
 use pkg::error::{HttpError, ErrorKind};
@@ -13,7 +13,7 @@ pub(pkg) const PING: u8 = 6u8;
 pub(pkg) const GOAWAY: u8 = 7u8;
 pub(pkg) const WINDOW_UPDATE: u8 = 8u8;
 pub(pkg) const CONTINUATION: u8 = 9u8;
-/// RFC 9218 section 7.1.
+/// From RFC 9218 (extensible priorities).
 pub(pkg) const PRIORITY_UPDATE: u8 = 0x10u8;
 
 pub(pkg) const END_STREAM: u8 = 0x1u8;
@@ -22,7 +22,7 @@ pub(pkg) const END_HEADERS: u8 = 0x4u8;
 pub(pkg) const PADDED: u8 = 0x8u8;
 pub(pkg) const PRIORITY_FLAG: u8 = 0x20u8;
 
-// Error codes (section 7).
+// Error codes.
 pub(pkg) const NO_ERROR: u32 = 0x0u32;
 pub(pkg) const PROTOCOL_ERROR: u32 = 0x1u32;
 pub(pkg) const INTERNAL_ERROR: u32 = 0x2u32;
@@ -34,7 +34,7 @@ pub(pkg) const CANCEL: u32 = 0x8u32;
 pub(pkg) const COMPRESSION_ERROR: u32 = 0x9u32;
 pub(pkg) const ENHANCE_YOUR_CALM: u32 = 0xbu32;
 
-// Settings (section 6.5.2).
+// Settings.
 pub(pkg) const S_HEADER_TABLE_SIZE: u16 = 1u16;
 pub(pkg) const S_ENABLE_PUSH: u16 = 2u16;
 pub(pkg) const S_MAX_CONCURRENT_STREAMS: u16 = 3u16;
@@ -139,7 +139,7 @@ pub(pkg) async fn read(io: Io, max: u32, deadline: Instant | none) throws (HttpE
     Frame { typ: typ, flags: flags, sid: sid, payload: io.take(len as usize) }
 }
 
-/// The payload of a DATA / HEADERS frame without its padding (6.1).
+/// The payload of a DATA / HEADERS frame without its padding.
 pub(pkg) fn unpad(f: Frame) throws (HttpError) -> List<u8> {
     if !f.has(PADDED) { return f.payload; }
     if f.payload.is_empty() { throw conn_err(PROTOCOL_ERROR, "padded frame without pad length"); }

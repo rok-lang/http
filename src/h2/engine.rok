@@ -119,7 +119,7 @@ impl Shared {
         using g = self.st.lock() { g.get().streams.insert(sid, si); }
     }
 
-    /// Whether `sid` was never opened (5.1: frames on idle streams).
+    /// Whether `sid` was never opened (frames on idle streams are an error).
     fn is_idle(self, sid: u32) -> bool {
         let st = self.snapshot();
         if self.server { sid % 2u32 == 0u32 || sid > st.last_peer } else { sid % 2u32 == 0u32 || sid >= st.next_id }
@@ -320,7 +320,7 @@ impl Shared {
             } else if t == frame::CONTINUATION {
                 throw conn_err(PROTOCOL_ERROR, "CONTINUATION without HEADERS");
             }
-            // Unknown frame types are ignored (5.5).
+            // Unknown frame types are ignored.
         }
     }
 
@@ -544,7 +544,7 @@ impl Shared {
         if !no_body { await self.send_body(sid, resp.body); }
         self.finish(sid, true);
         // The request body was not read to the end: tell the client to
-        // stop sending (8.1).
+        // stop sending.
         if let si: StreamIn = self.stream(sid) {
             if !si.remote_done { self.reset(sid, NO_ERROR); }
         }

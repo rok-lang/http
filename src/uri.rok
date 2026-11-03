@@ -93,7 +93,7 @@ impl Uri {
         }
     }
 
-    /// The syntax-based normalization of RFC 3986 6.2.2 plus the
+    /// The syntax-based normalization of RFC 3986 plus the
     /// scheme-based one for http / https: lowercase scheme and host,
     /// uppercase escapes, unreserved characters decoded, dot segments
     /// removed, a default port dropped, an empty path made `/`.
@@ -114,7 +114,7 @@ impl Uri {
         u
     }
 
-    /// Resolve `reference` against this base URI (RFC 3986 5.2.2).
+    /// Resolve `reference` against this base URI.
     pub fn resolve(self, reference: Uri) -> Uri {
         let r = reference;
         let t = Uri {};
@@ -313,7 +313,7 @@ fn norm_pct(s: str) -> str {
     bytes_to_str(out)
 }
 
-/// RFC 3986 5.2.3.
+/// `rel` merged onto the base's path.
 fn merge(base: Uri, rel: str) -> str {
     if base.host is str && base.path.is_empty() { return "/" + rel; }
     match base.path.rfind("/") {
@@ -322,7 +322,7 @@ fn merge(base: Uri, rel: str) -> str {
     }
 }
 
-/// RFC 3986 5.2.4.
+/// `path` with its `.` and `..` segments resolved.
 pub fn remove_dot_segments(path: str) -> str {
     let input = path;
     let out: List<str> = List::new();

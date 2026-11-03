@@ -51,7 +51,7 @@ pub(pkg) struct RespHead {
     pub headers: HeaderMap;
 }
 
-/// How the body of a message is delimited (RFC 9112 6.3).
+/// How the body of a message is delimited.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(pkg) enum Framing {
     Empty,
@@ -63,8 +63,7 @@ pub(pkg) enum Framing {
 
 /// The head block (through the empty line), or `none` if the stream
 /// ended before its first byte. `first`: the deadline for that first
-/// byte; `rest`: for the remainder. Leading empty lines are skipped
-/// (RFC 9112 2.2).
+/// byte; `rest`: for the remainder. Leading empty lines are skipped.
 #[cfg(feature = "http1")]
 pub(pkg) async fn read_block(io: Io, max: usize, first: Instant | none, rest: Instant | none) throws (HttpError) -> List<u8> | none {
     let started = false;
@@ -293,7 +292,7 @@ async fn read_line(io: Io, max: usize, deadline: Instant | none) throws (HttpErr
     }
 }
 
-/// A chunk-size line's size (RFC 9112 7.1); extensions are checked and
+/// A chunk-size line's size; extensions are checked and
 /// dropped.
 #[cfg(feature = "http1")]
 fn chunk_size(line: str) throws (HttpError) -> u64 {
@@ -466,7 +465,7 @@ pub(pkg) async fn recv_within<T>(rx: Receiver<T>, limit: Duration | none) -> T |
     }
 }
 
-/// `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110 5.6.7) for Unix time
+/// `Sun, 06 Nov 1994 08:49:37 GMT` (IMF-fixdate) for Unix time
 /// `secs`.
 pub fn http_date(secs: i64) -> str {
     let days = secs.div_euclid(86400);

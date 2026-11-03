@@ -400,7 +400,7 @@ async fn sniff_preface(io: Io, deadline: Instant | none) throws (HttpError) -> b
     }
 }
 
-/// The request's URI from its target (RFC 9112 3.2) and `Host`.
+/// The request's URI from its target and `Host`.
 #[cfg(feature = "http1")]
 fn request_uri(head: h1::ReqHead) throws (HttpError) -> Uri {
     let hosts = head.headers.get_all("host");

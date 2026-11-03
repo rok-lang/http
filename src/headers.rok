@@ -1,4 +1,4 @@
-// Header fields (RFC 9110 section 5): a case-insensitive multimap that
+// Header fields (RFC 9110): a case-insensitive multimap that
 // keeps insertion order.
 
 use pkg::error::{HttpError, parse_err};
@@ -110,7 +110,7 @@ impl Debug for HeaderMap {
     fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"{self.entries():?}") }
 }
 
-/// A `tchar` (RFC 9110 5.6.2).
+/// A `tchar`: a token character.
 pub(pkg) fn is_tchar(b: u8) -> bool {
     if b >= 0x61u8 && b <= 0x7Au8 || b >= 0x41u8 && b <= 0x5Au8 || b >= 0x30u8 && b <= 0x39u8 { return true; }
     b == 0x21u8 || b == 0x23u8 || b == 0x24u8 || b == 0x25u8 || b == 0x26u8 || b == 0x27u8 || b == 0x2Au8
@@ -128,7 +128,7 @@ pub fn is_token(s: str) -> bool {
 }
 
 /// A field value: visible ASCII, space, tab and obs-text, no leading or
-/// trailing whitespace (RFC 9110 5.5).
+/// trailing whitespace.
 pub fn is_field_value(s: str) -> bool {
     for b in s.bytes() {
         if b < 0x20u8 && b != 0x09u8 || b == 0x7Fu8 { return false; }
