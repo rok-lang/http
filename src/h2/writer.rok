@@ -2,7 +2,7 @@
 // write half, the HPACK encoder, the send windows and the stream
 // scheduler; everything else talks to it through `Cmd`s.
 
-use pkg::conn::{Io, Wire, deadline_in};
+use pkg::conn::{Io, deadline_in};
 use pkg::h2::frame;
 use pkg::h2::frame::{Prio, MAX_WINDOW, FLOW_CONTROL_ERROR};
 use pkg::h2::hpack::Encoder;
@@ -39,9 +39,9 @@ fn tell(ack: Sender<i32> | none, v: i32) {
     if let a: Sender<i32> = ack { let _ = try? a.send(v); }
 }
 
-/// Run until `Close` and the channel's end.
-pub(pkg) async fn run(wire: Wire, rx: Receiver<Cmd>, huffman: bool, timeout: Duration | none) {
-    let io = Io::of(wire);
+/// Run until `Close` and the channel's end, then close `io` (this
+/// task's own `Io` on the connection).
+pub(pkg) async fn run(io: Io, rx: Receiver<Cmd>, huffman: bool, timeout: Duration | none) {
     let w = W {
         enc: Encoder::new(huffman),
         wins: Dict::new(),
@@ -79,6 +79,7 @@ pub(pkg) async fn run(wire: Wire, rx: Receiver<Cmd>, huffman: bool, timeout: Dur
         }
     }
     w.die();
+    io.close();
 }
 
 struct W {

@@ -10,7 +10,7 @@ fn bytes(s: str) -> List<u8> { s.as_bytes().to_list() }
 fn req_status(s: str) -> u32 {
     try {
         let h = parse_request_head(bytes(s), Limits {});
-        request_framing(h);
+        _ = request_framing(h);
         0u32
     } catch e: HttpError { e.code }
 }
@@ -95,7 +95,7 @@ pub(pkg) async fn test_handler(req: Request) -> Response {
     }
     if p == "/stream" {
         let (w, body) = Body::channel();
-        task::spawn(async {
+        _ = task::spawn(async {
             for i in 0..50 { let _ = try? await w.send_str(f"line {i}\n"); }
             w.finish();
             0
@@ -122,7 +122,7 @@ pub(pkg) async fn test_handler(req: Request) -> Response {
 pub(pkg) fn start(cfg: ServerConfig | none = none) -> (Server, str) {
     let s = try! Server::bind("127.0.0.1:0", test_handler, cfg);
     let a = try! s.local_addr();
-    task::spawn(async {
+    _ = task::spawn(async {
         try! await s.run();
         0
     });
@@ -135,14 +135,14 @@ pub(pkg) async fn raw(base: str, data: str) -> str {
     try! await s.write_all_async(data);
     let _ = try? s.shutdown(Shutdown::Write);
     let back = try! await s.read_to_end_async();
-    s.close();
+    try! s.close();
     try! str::from_utf8(back)
 }
 
 /// The kind of error `GET url` ends with, `none` on success.
 pub(pkg) async fn err_kind(c: Client, url: str) -> ErrorKind | none {
     try {
-        await c.get(url);
+        _ = await c.get(url);
         none
     } catch e: HttpError { e.kind }
 }
@@ -179,7 +179,7 @@ fn loopback_streaming_upload() {
     task::block_on(async {
         let (srv, base) = start();
         let (w, body) = Body::channel();
-        task::spawn(async {
+        _ = task::spawn(async {
             for i in 0..100 { try! await w.send_str(f"{i},"); }
             w.finish();
             0

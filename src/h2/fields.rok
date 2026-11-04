@@ -1,4 +1,4 @@
-// HTTP/2 <-> HTTP field translation (RFC 9113 section 8): validate
+// HTTP/2 <-> HTTP field translation (RFC 9113): validate
 // pseudo-headers and field syntax, and build Request / Response.
 
 use pkg::body::Body;
@@ -26,12 +26,12 @@ pub(pkg) fn h1_content_length(h: HeaderMap) throws (HttpError) -> u64 | none {
     n
 }
 
-/// Fields that only mean something on an HTTP/1.1 connection (8.2.2).
+/// Fields that only mean something on an HTTP/1.1 connection.
 pub(pkg) fn connection_specific(n: str) -> bool {
     n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "transfer-encoding" || n == "upgrade"
 }
 
-/// A valid field (8.2.1): lowercase token name, value without NUL / CR
+/// A valid field: lowercase token name, value without NUL / CR
 /// / LF or surrounding whitespace.
 pub(pkg) fn valid_field(n: str, v: str) -> bool {
     let name = if n.starts_with(":") { n[1:] } else { n };
@@ -51,7 +51,7 @@ pub(pkg) fn valid_field(n: str, v: str) -> bool {
     true
 }
 
-/// A request from its fields (8.3); throws if malformed.
+/// A request from its fields; throws if malformed.
 pub(pkg) fn build_request(fields: List<(str, str)>) throws (HttpError) -> Request {
     let method: str | none = none;
     let scheme: str | none = none;
@@ -85,7 +85,7 @@ pub(pkg) fn build_request(fields: List<(str, str)>) throws (HttpError) -> Reques
         if connection_specific(n) || n == "te" && v != "trailers" { throw conn_err(PROTOCOL_ERROR, f"connection-specific field {n}"); }
         if n == "cookie" { cookies.push(v); } else { h.append(n, v); }
     }
-    // 8.2.3: cookie fields are joined for an HTTP/1.1 view.
+    // Cookie fields are joined for an HTTP/1.1 view.
     if !cookies.is_empty() { h.append("cookie", cookies.join("; ")); }
     let m = try Method::parse(method ?? "") catch _ { throw conn_err(PROTOCOL_ERROR, "missing or invalid :method"); };
     let u = Uri {};

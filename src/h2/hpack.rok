@@ -23,10 +23,10 @@ const STATIC: [(str, str); 61] = [
 
 fn err(msg: str) -> HttpError { HttpError { kind: ErrorKind::Protocol, message: msg, code: 9u32 } }
 
-/// The dynamic table (2.3.2): newest entry last.
+/// The dynamic table: newest entry last.
 pub(pkg) struct Table {
     entries: List<(str, str)>;
-    /// `[size, max size]` in the RFC's accounting (4.1).
+    /// `[size, max size]` in the RFC's accounting (32 bytes per entry).
     sz: List<usize>;
 }
 
@@ -91,7 +91,7 @@ impl Table {
     }
 }
 
-// Integer and string primitives (RFC 7541 5.1, 5.2).
+// Integer and string primitives.
 
 /// An integer with an `n`-bit prefix; `flags` fill the high bits of the
 /// first byte.
@@ -182,7 +182,7 @@ impl Decoder {
     pub fn new(limit: usize = 4096) -> Decoder { Decoder { table: Table::new(limit), limit: [limit] } }
 
     /// Decode a complete header block; throws a compression error
-    /// (code 9), or `TooLarge` past `max_list` bytes of fields (4.1
+    /// (code 9), or `TooLarge` past `max_list` bytes of fields (RFC
     /// accounting).
     pub fn decode(self, block: List<u8>, max_list: usize = 1usize << 20usize) throws (HttpError) -> List<(str, str)> {
         let r = Rd { b: block, at: [0usize] };
@@ -200,7 +200,7 @@ impl Decoder {
                 out.push((n, v));
                 fields = true;
             } else if b & 0xE0u8 == 0x20u8 {
-                // Size updates only at the start of a block (4.2).
+                // Size updates only at the start of a block.
                 if fields { throw err("table size update after a field"); }
                 let m = try r.integer(5u32);
                 if m > self.limit[0] { throw err("table size update over the limit"); }
@@ -228,7 +228,7 @@ pub(pkg) struct Encoder {
     pub table: Table;
     pub huffman: bool;
     /// `[pending table size update or usize::MAX, smallest since the
-    /// last block]` (4.2: the smallest is signalled first).
+    /// last block]`; the smallest is signalled first.
     upd: List<usize>;
 }
 
@@ -265,7 +265,7 @@ impl Encoder {
                 continue;
             }
             if n == "authorization" || n == "proxy-authorization" || n == "cookie" && v.len() < 20 {
-                // Never indexed (6.2.3, 7.1.3).
+                // Credentials and short cookies are never indexed.
                 put_int(out, 0x10u8, 4u32, by_name);
             } else {
                 put_int(out, 0x40u8, 6u32, by_name);

@@ -5,7 +5,7 @@
 // WINDOW_UPDATEs. Stream state shared by them sits behind one mutex.
 
 use pkg::body::{Body, Chunk};
-use pkg::conn::{Io, Wire, deadline_in, left, spawn_with};
+use pkg::conn::{Io, Tx, deadline_in, left};
 use pkg::error::{HttpError, ErrorKind};
 use pkg::h1::recv_within;
 use pkg::h2::frame::{Frame, conn_err, u32_at};
@@ -19,6 +19,7 @@ use pkg::h2::Config;
 use pkg::h2::writer;
 use pkg::h2::frame;
 use pkg::h2::fields::*;
+use rok::core::marker;
 
 struct StreamIn {
     /// Where DATA goes; `none` before a body exists or once it ended.
@@ -64,8 +65,8 @@ struct Snap {
 /// A connection's shared side. Copies share it.
 pub(pkg) struct Shared {
     st: Mutex<State>;
-    w: Sender<Cmd>;
-    credit: Sender<(u32, usize)>;
+    w: Tx<Cmd>;
+    credit: Tx<(u32, usize)>;
     cfg: Config;
     server: bool;
     /// The writer task: done once everything queued is written.
@@ -78,7 +79,7 @@ fn reset_err(code: u32) -> HttpError { HttpError { kind: ErrorKind::Reset, messa
 
 impl Shared {
     /// Start the writer and credit tasks and queue our preface settings.
-    fn new(w: Wire, cfg: Config, server: bool) -> Shared {
+    fn new(w: Io, cfg: Config, server: bool) -> Shared {
         let (wtx, wrx) = channel::<Cmd>();
         let (ctx, crx) = channel::<(u32, usize)>();
         let huff = cfg.huffman;
@@ -87,8 +88,8 @@ impl Shared {
             await writer::run(w, wrx, huff, wt);
             0
         });
-        let sh = Shared { st: Mutex::new(State { streams: Dict::new() }), w: wtx, credit: ctx, cfg: cfg, server: server, wtask: wtask };
-        task::spawn(async {
+        let sh = Shared { st: Mutex::new(State { streams: Dict::new() }), w: Tx::new(wtx), credit: Tx::new(ctx), cfg: cfg, server: server, wtask: wtask };
+        _ = task::spawn(async {
             await sh.credits(crx);
             0
         });
@@ -104,7 +105,7 @@ impl Shared {
         sh
     }
 
-    fn cmd(self, c: Cmd) { let _ = try? self.w.send(c); }
+    fn cmd(self, c: Cmd) { _ = self.w.send(c); }
 
     fn raw(self, b: List<u8>) { self.cmd(Cmd::Raw(b)); }
 
@@ -118,7 +119,7 @@ impl Shared {
         using g = self.st.lock() { g.get().streams.insert(sid, si); }
     }
 
-    /// Whether `sid` was never opened (5.1: frames on idle streams).
+    /// Whether `sid` was never opened (frames on idle streams are an error).
     fn is_idle(self, sid: u32) -> bool {
         let st = self.snapshot();
         if self.server { sid % 2u32 == 0u32 || sid > st.last_peer } else { sid % 2u32 == 0u32 || sid >= st.next_id }
@@ -251,7 +252,7 @@ impl Shared {
         };
         self.shut(why);
         // Let the writer flush (GOAWAY) before the socket is closed.
-        await self.wtask;
+        _ = await self.wtask;
     }
 
     async fn frames(self, io: Io, handler: Handler | none) throws (HttpError) {
@@ -319,7 +320,7 @@ impl Shared {
             } else if t == frame::CONTINUATION {
                 throw conn_err(PROTOCOL_ERROR, "CONTINUATION without HEADERS");
             }
-            // Unknown frame types are ignored (5.5).
+            // Unknown frame types are ignored.
         }
     }
 
@@ -520,16 +521,16 @@ impl Shared {
         if !end {
             let (tx, rx) = channel::<Chunk>();
             si.body = tx;
-            req.body = Body::pulled(rx, self.credit, sid, len);
+            req.body = Body::pulled(rx, self.credit.sender(), sid, len);
         }
         self.put(sid, si);
         self.cmd(Cmd::Open(sid));
         if let pv: str = req.headers.get("priority") { self.cmd(Cmd::Priority(sid, frame::parse_priority(pv))); }
         let me = self;
-        spawn_with(req, async |r: Request| {
-            await me.respond(sid, handler, r);
+        _ = task::spawn((async [move req] || {
+            await me.respond(sid, handler, req);
             0
-        });
+        })());
     }
 
     async fn respond(self, sid: u32, handler: Handler, req: Request) {
@@ -543,7 +544,7 @@ impl Shared {
         if !no_body { await self.send_body(sid, resp.body); }
         self.finish(sid, true);
         // The request body was not read to the end: tell the client to
-        // stop sending (8.1).
+        // stop sending.
         if let si: StreamIn = self.stream(sid) {
             if !si.remote_done { self.reset(sid, NO_ERROR); }
         }
@@ -559,14 +560,14 @@ impl Shared {
             };
             match c {
                 b: List<u8> => {
-                    self.cmd(Cmd::Data(sid, b, false, atx));
+                    self.cmd(Cmd::Data(sid, b, false, atx.clone()));
                     if (await arx.recv_async() ?? -1) != 0 { return; }
                 },
                 none => {
                     // Wait for the END_STREAM frame too: a reset after the
                     // response (`respond`) must follow it, not drop it.
                     self.cmd(Cmd::Data(sid, List::new(), true, atx));
-                    await arx.recv_async();
+                    _ = await arx.recv_async();
                     return;
                 },
             }
@@ -610,7 +611,7 @@ impl Shared {
             let (tx, rx) = channel::<Chunk>();
             si.body = tx;
             si.expect = len;
-            resp.body = Body::pulled(rx, self.credit, sid, len);
+            resp.body = Body::pulled(rx, self.credit.sender(), sid, len);
         }
         self.put(sid, si);
         let _ = try? waiter.send(resp);
@@ -618,12 +619,14 @@ impl Shared {
     }
 }
 
-/// Serve one connection whose client preface is buffered in `io`.
+/// Serve one connection whose client preface is buffered in `io` (the
+/// caller closes it after).
 /// `drain`: a message starts a graceful shutdown.
 pub(pkg) async fn serve_conn(io: Io, handler: Handler, cfg: Config, drain: Receiver<i32>) {
     io.consume(frame::PREFACE.len());
-    let sh = Shared::new(io.wire(), cfg, true);
-    task::spawn(async {
+    let w = try io.split() catch _ { return; };
+    let sh = Shared::new(w, cfg, true);
+    _ = task::spawn(async {
         if await drain.recv_async() is i32 { sh.drain(); }
         0
     });
@@ -639,10 +642,14 @@ impl ClientConn {
     /// Send the preface and settings over `io` and start reading.
     pub async fn start(io: Io, cfg: Config, deadline: Instant | none) throws (HttpError) -> ClientConn {
         try await io.write(frame::PREFACE.as_bytes(), deadline);
-        let sh = Shared::new(io.wire(), cfg, false);
-        spawn_with(io, async |c: Io| {
-            await sh.read_loop(c, none);
-            c.close();
+        let w = try io.split() catch e: HttpError {
+            io.close();
+            throw e;
+        };
+        let sh = Shared::new(w, cfg, false);
+        _ = task::spawn(async {
+            await sh.read_loop(io, none);
+            io.close();
             0
         });
         ClientConn { sh: sh }
@@ -670,7 +677,7 @@ impl ClientConn {
         for (n, v) in req.headers.entries() {
             if !connection_specific(n) && n != "host" && n != "te" { fields.push((n, v)); }
         }
-        if !req.headers.contains("user-agent") { fields.push(("user-agent", "rok-http/0.1")); }
+        if !req.headers.contains("user-agent") { fields.push(("user-agent", "rok-http/0.2")); }
         let body = req.body;
         let empty = body.is_empty();
         if !empty && !req.headers.contains("content-length") {
@@ -679,6 +686,8 @@ impl ClientConn {
         // Wait for room under the peer's stream limit.
         let sid = 0u32;
         let (htx, hrx) = channel::<Response | HttpError>();
+        // Goes to the stream once it opens.
+        let head: Sender<Response | HttpError> | none = htx;
         loop {
             let full = false;
             let dead = false;
@@ -691,7 +700,7 @@ impl ClientConn {
                 } else {
                     sid = st.next_id;
                     st.next_id = sid + 2u32;
-                    st.streams.insert(sid, StreamIn { head: htx, method_head: req.method == Method::HEAD, window: sh.cfg.initial_window_size as i64, local_done: empty });
+                    st.streams.insert(sid, StreamIn { head: marker::replace(ref head, none), method_head: req.method == Method::HEAD, window: sh.cfg.initial_window_size as i64, local_done: empty });
                     g.set(st);
                     // Under the lock: header blocks go out in stream id order.
                     sh.cmd(Cmd::Headers(sid, fields, empty));
@@ -706,11 +715,11 @@ impl ClientConn {
             await task::sleep(Duration::ms(5));
         }
         if !empty {
-            spawn_with(body, async |b: Body| {
-                await sh.send_body(sid, b);
+            _ = task::spawn((async [move body] || {
+                await sh.send_body(sid, body);
                 sh.finish(sid, true);
                 0
-            });
+            })());
         }
         let limit: Duration | none = match deadline {
             d: Instant => left(d),

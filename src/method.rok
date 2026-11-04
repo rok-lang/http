@@ -1,4 +1,4 @@
-// Request methods (RFC 9110 section 9).
+// Request methods (RFC 9110).
 
 use pkg::error::{HttpError, parse_err};
 use pkg::headers::is_token;
@@ -29,12 +29,12 @@ impl Method {
 
     pub fn as_str(self) -> str { self.name }
 
-    /// GET, HEAD, OPTIONS, TRACE (9.2.1).
+    /// GET, HEAD, OPTIONS, TRACE.
     pub fn is_safe(self) -> bool {
         self.name == "GET" || self.name == "HEAD" || self.name == "OPTIONS" || self.name == "TRACE"
     }
 
-    /// The safe methods plus PUT and DELETE (9.2.2).
+    /// The safe methods plus PUT and DELETE.
     pub fn is_idempotent(self) -> bool { self.is_safe() || self.name == "PUT" || self.name == "DELETE" }
 }
 

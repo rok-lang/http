@@ -1,4 +1,4 @@
-// Huffman code of HPACK (RFC 7541 5.2, table in Appendix B).
+// Huffman code of HPACK (table from RFC 7541 Appendix B).
 
 use pkg::error::{HttpError, ErrorKind};
 

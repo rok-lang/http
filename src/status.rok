@@ -1,4 +1,4 @@
-// Status codes (RFC 9110 section 15).
+// Status codes (RFC 9110).
 
 use pkg::error::{HttpError, parse_err};
 
