@@ -1,0 +1,62 @@
+# Publish the stone to rokstones.io when a v* tag is pushed. Trusted
+# publishing: the job's OIDC token is traded for a token that lasts 30
+# minutes, so the repository keeps no secret. Copy to
+# .github/workflows/publish.yml and add the stone's trusted publisher
+# (this repository, `publish.yml`) on rokstones.io.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  # a tag pushed before this file was in the repository
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish, e.g. v0.3.1
+        required: true
+
+permissions:
+  contents: read
+  # the OIDC token
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    # with an environment here, name it in the trusted publisher too
+    # environment: release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install rok
+        run: |
+          v=$(curl -fsSL https://github.com/rok-lang/rok/releases/latest/download/rok-version)
+          curl -fsSL https://rok-lang.org/install.sh | ROK_NO_MODIFY_PATH=1 sh -s -- -q --version "$v"
+          echo "$HOME/.rok/bin" >> "$GITHUB_PATH"
+
+      - name: Check
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          want=$(sed -n 's/^ *version: "\(.*\)",*$/\1/p' rok.rokon | head -1)
+          [ "v$want" = "$TAG" ] || { echo "tag $TAG, but rok.rokon has version $want" >&2; exit 1; }
+          rok test
+          rok publish --dry-run
+
+      - name: Log in with the job's OIDC token
+        run: |
+          jwt=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rokstones.io" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+          out=$(curl -sS --fail-with-body -H 'Content-Type: application/rokon' \
+            --data-binary "TrustedPublishing { jwt: \"$jwt\" }" \
+            https://rokstones.io/api/v1/trusted-publishing/token) || { echo "$out" >&2; exit 1; }
+          tok=$(printf '%s' "$out" | sed -n 's/.*token: "\(rkt_[0-9a-f]*\)".*/\1/p')
+          [ -n "$tok" ]
+          echo "::add-mask::$tok"
+          # stdin, not argv
+          printf '%s\n' "$tok" | rok login
+
+      - name: Publish
+        run: rok publish
