@@ -12,4 +12,5 @@ advisory unless you prefer otherwise.
 
 ## Supported versions
 
-rok is pre-1.0. Security fixes land on the latest 0.x release.
+Rok is pre-1.0. Fixes and security fixes land on the latest 0.x series only.
+The 0.1 series (0.1.0 to 0.1.6) is no longer supported since Rok 0.2.0.
