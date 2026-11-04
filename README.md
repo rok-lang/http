@@ -11,6 +11,8 @@ response splitting.
 rok add http
 ```
 
+Needs Rok 0.2 or later; Rok 0.1 is no longer supported and cannot read the stone index.
+
 Features `http1`, `http2` and `tls` are on by default; turn off what you do not
 need with `default_features: false`.
 
